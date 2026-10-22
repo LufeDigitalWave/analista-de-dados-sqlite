@@ -3,6 +3,7 @@
 Implementação do **Desafio Técnico 1**: um assistente que recebe perguntas em português, descobre o esquema do banco em tempo de execução, consulta SQLite e apresenta resposta, dados, gráfico quando pertinente e as consultas executadas. Não há SQL pronto para as perguntas do enunciado no código da aplicação.
 
 A [especificação de estabilização](docs/superpowers/specs/2026-10-22-estabilizacao-case-design.md) e o [plano de tarefas](docs/superpowers/plans/2026-10-22-estabilizacao-case.md) registram escopo, critérios de aceite, riscos e verificações desta entrega.
+O [estado consolidado da entrega](docs/STATUS-ENTREGA.md) separa evidência verificada, revisão pendente e limites do protótipo.
 
 ## Executar
 
