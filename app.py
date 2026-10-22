@@ -30,6 +30,11 @@ def database_path() -> Path:
     return Path(__file__).resolve().parent / configured
 
 
+def create_openai_client() -> OpenAI:
+    """Bound one provider request so a stalled network cannot freeze the UI indefinitely."""
+    return OpenAI(timeout=30.0, max_retries=1)
+
+
 def render_steps(steps: tuple[TraceStep, ...]) -> None:
     """Show tool activity, never the model's private reasoning."""
     for index, step in enumerate(steps, start=1):
@@ -129,7 +134,7 @@ def main() -> None:
         with st.status("Consultando o banco…", expanded=False) as status:
             try:
                 db = SQLiteReadOnly(path)
-                model = OpenAIModel(OpenAI(), model=model_name)
+                model = OpenAIModel(create_openai_client(), model=model_name)
                 st.session_state.answer = DataAnalyst(db, model).ask(question)
             except (AgentError, ValueError) as exc:
                 st.session_state.error = exc

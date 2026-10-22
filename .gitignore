@@ -3,12 +3,15 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.playwright-cli/
 .streamlit/secrets.toml
 .env
 .env.*
 !.env.example
-data/*.db
-data/*.sqlite*
+data/
+*.db
+*.db-*
+*.sqlite*
 evals/results/
 work/
 *.log

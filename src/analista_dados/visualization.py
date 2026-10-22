@@ -1,10 +1,17 @@
 """Prepare trustworthy tables and charts from executed SQL results."""
 
+import re
 from dataclasses import dataclass
 
 import pandas as pd
 
 from analista_dados.models import ChartSpec, QueryResult
+
+_TEMPORAL_PARTS = {"ano", "mes", "mês", "data", "dia", "semana", "trimestre"}
+
+
+def _is_temporal_column(column: str) -> bool:
+    return any(part in _TEMPORAL_PARTS for part in re.split(r"[\W_]+", column.casefold()))
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,46 @@ def prepare_visualization(
 
     x_column = suggestion.x_column
     y_column = suggestion.y_column
+    series_column = suggestion.series_column
+    if override in {"bar", "line"}:
+        if override == "line" and not x_column:
+            x_column = next(
+                (
+                    column
+                    for column in table.columns
+                    if column not in {y_column, series_column} and _is_temporal_column(column)
+                ),
+                "",
+            )
+        if not x_column:
+            x_column = next(
+                (
+                    column
+                    for column in table.columns
+                    if column not in {y_column, series_column}
+                    and not pd.api.types.is_numeric_dtype(table[column])
+                ),
+                "",
+            )
+        if not x_column:
+            x_column = next(
+                (
+                    column
+                    for column in table.columns
+                    if column not in {y_column, series_column} and _is_temporal_column(column)
+                ),
+                "",
+            )
+        if not y_column:
+            y_column = next(
+                (
+                    column
+                    for column in table.columns
+                    if column not in {x_column, series_column}
+                    and pd.api.types.is_numeric_dtype(table[column])
+                ),
+                "",
+            )
     if (
         len(set(result.columns)) != len(result.columns)
         or x_column not in table.columns
@@ -38,7 +85,21 @@ def prepare_visualization(
     ):
         return fallback
 
-    series_column = suggestion.series_column
+    if override == "line" and not suggestion.x_column and _is_temporal_column(x_column):
+        if not series_column:
+            candidates = [
+                column
+                for column in table.columns
+                if column not in {x_column, y_column}
+                and not pd.api.types.is_numeric_dtype(table[column])
+            ]
+            if len(candidates) > 1:
+                return fallback
+            if candidates:
+                series_column = candidates[0]
+            elif table[x_column].duplicated().any():
+                return fallback
+
     if not series_column:
         frame = table[[x_column, y_column]].copy()
         return PreparedVisualization(kind, frame, table, x_column, (y_column,))

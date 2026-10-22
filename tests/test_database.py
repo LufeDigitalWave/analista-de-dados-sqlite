@@ -168,3 +168,95 @@ def test_caps_oversized_scalar_result(tmp_path):
     # SQLite may return NULL or a bounded string, depending on its build.
     scalar = result.rows[0][0]
     assert scalar is None or len(scalar.encode("utf-8")) <= 64 * 1024
+
+
+def test_denies_personal_column_variants_without_blocking_campaign_name(tmp_path):
+    path = tmp_path / "variants.db"
+    personal_columns = (
+        "nome_cliente",
+        "cliente_nome",
+        "endereco",
+        "telefone_contato",
+        "cpf_cliente",
+        "email_pessoal",
+        "nome_completo",
+    )
+    with sqlite3.connect(path) as connection:
+        definitions = ", ".join(f'"{column}" TEXT' for column in personal_columns)
+        connection.execute(f"CREATE TABLE dados ({definitions}, nome_campanha TEXT)")
+        placeholders = ", ".join("?" for _ in range(len(personal_columns) + 1))
+        connection.execute(
+            f"INSERT INTO dados VALUES ({placeholders})",
+            (*(["sintetico"] * len(personal_columns)), "Campanha de exemplo"),
+        )
+
+    store = SQLiteReadOnly(path)
+    for column in personal_columns:
+        with pytest.raises(QueryError, match="protegida"):
+            store.run_sql(f'SELECT "{column}" FROM dados')
+    assert store.run_sql("SELECT nome_campanha FROM dados").rows == (("Campanha de exemplo",),)
+
+
+def test_rejects_result_when_total_payload_exceeds_budget(tmp_path):
+    path = tmp_path / "large.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE dados (id INTEGER, texto TEXT)")
+        connection.executemany(
+            "INSERT INTO dados (id, texto) VALUES (?, ?)",
+            ((index, "x" * 50_000) for index in range(3)),
+        )
+    store = SQLiteReadOnly(path)
+
+    with pytest.raises(QueryError, match="resultado.*128 KiB"):
+        store.run_sql("SELECT texto FROM dados ORDER BY id")
+
+    assert store.run_sql("SELECT COUNT(*) AS total FROM dados").rows == ((3,),)
+
+
+def test_rejects_large_column_metadata_even_when_query_has_no_rows(tmp_path):
+    path = make_db(tmp_path, "CREATE TABLE eventos (id INTEGER, canal TEXT);")
+    first_alias = "a" * 65_525
+    second_alias = "b" * 65_525
+
+    with pytest.raises(QueryError, match="resultado.*128 KiB"):
+        SQLiteReadOnly(path).run_sql(f'SELECT 1 AS "{first_alias}", 2 AS "{second_alias}" WHERE 0')
+
+
+def test_payload_budget_counts_binary_placeholder_sent_to_agent(tmp_path):
+    path = tmp_path / "binary.db"
+    blob_columns = ", ".join(f"blob_{index} BLOB" for index in range(10))
+    with sqlite3.connect(path) as connection:
+        connection.execute(f"CREATE TABLE dados (id INTEGER, texto TEXT, {blob_columns})")
+        placeholders = ", ".join("?" for _ in range(12))
+        connection.executemany(
+            f"INSERT INTO dados VALUES ({placeholders})",
+            ((index, "x" * 450, *([b""] * 10)) for index in range(200)),
+        )
+    selected_blobs = ", ".join(f"blob_{index}" for index in range(10))
+
+    with pytest.raises(QueryError, match="resultado.*128 KiB"):
+        SQLiteReadOnly(path).run_sql(f"SELECT texto, {selected_blobs} FROM dados ORDER BY id")
+
+
+def test_allows_state_and_customer_id_in_distinct_join_aggregate(tmp_path):
+    path = tmp_path / "aggregation.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE clientes (id INTEGER, estado TEXT)")
+        connection.execute("CREATE TABLE compras (id INTEGER, cliente_id INTEGER)")
+        connection.executemany(
+            "INSERT INTO clientes (id, estado) VALUES (?, ?)",
+            ((1, "SP"), (2, "SP"), (3, "RJ")),
+        )
+        connection.executemany(
+            "INSERT INTO compras (id, cliente_id) VALUES (?, ?)",
+            ((10, 1), (11, 1), (12, 2), (13, 3)),
+        )
+
+    result = SQLiteReadOnly(path).run_sql(
+        "SELECT c.estado, COUNT(DISTINCT p.cliente_id) AS clientes_unicos "
+        "FROM compras AS p JOIN clientes AS c ON c.id = p.cliente_id "
+        "GROUP BY c.estado ORDER BY c.estado"
+    )
+
+    assert result.columns == ("estado", "clientes_unicos")
+    assert result.rows == (("RJ", 1), ("SP", 2))

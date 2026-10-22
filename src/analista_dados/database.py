@@ -1,19 +1,58 @@
 """Read-only SQLite boundary for model-proposed analytical queries."""
 
+import json
 import re
 import sqlite3
+import unicodedata
 from contextlib import closing
 from pathlib import Path
 from time import perf_counter
 
 from .models import QueryResult
 
-PROTECTED_COLUMNS = frozenset({"nome", "email", "cpf", "telefone"})
+PROTECTED_TOKENS = frozenset({"email", "cpf", "telefone", "endereco", "celular"})
 ALLOWED_ACTIONS = frozenset(
     {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
 )
 DENIED_FUNCTIONS = frozenset({"load_extension", "readfile", "writefile", "randomblob", "zeroblob"})
 MAX_VALUE_BYTES = 64 * 1024
+MAX_RESULT_BYTES = 128 * 1024
+
+
+def _is_protected_column(column: str) -> bool:
+    # Split both snake_case and camelCase, then fold accents for common PT-BR names.
+    separated = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", column)
+    folded = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", separated.casefold())
+        if not unicodedata.combining(character)
+    )
+    tokens = set(filter(None, re.split(r"[^a-z0-9]+", folded)))
+    if tokens & PROTECTED_TOKENS:
+        return True
+    return "nome" in tokens and tokens != {"nome", "campanha"}
+
+
+def _tool_output_size(columns: tuple[str, ...], rows: list[tuple]) -> int:
+    # This envelope mirrors the SQL tool result. ASCII escaping is a conservative
+    # upper bound for the UTF-8 JSON later sent by the agent.
+    payload = {
+        "ok": True,
+        "query_number": 999,
+        "columns": columns,
+        "rows": rows,
+        "truncated": False,
+        "elapsed_ms": 999999999999.99,
+    }
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            default=lambda value: (
+                "[valor binário omitido]" if isinstance(value, bytes) else str(value)
+            ),
+        )
+    )
 
 
 class QueryError(ValueError):
@@ -68,7 +107,7 @@ class SQLiteReadOnly:
         time_expired = False
 
         def authorize(action: int, name: str | None, detail: str | None, *_: str | None) -> int:
-            if action == sqlite3.SQLITE_READ and detail and detail.casefold() in PROTECTED_COLUMNS:
+            if action == sqlite3.SQLITE_READ and detail and _is_protected_column(detail):
                 blocked.append("Leitura de coluna protegida não permitida.")
                 return sqlite3.SQLITE_DENY
             if (
@@ -94,11 +133,26 @@ class SQLiteReadOnly:
                 connection.set_authorizer(authorize)
                 connection.set_progress_handler(check_deadline, 1000)
                 cursor = connection.execute(statement)
-                rows = tuple(tuple(row) for row in cursor.fetchmany(self.row_limit + 1))
+                columns = tuple(column[0] for column in cursor.description)
+                if _tool_output_size(columns, []) > MAX_RESULT_BYTES:
+                    raise QueryError(
+                        "O resultado SQL excede o limite total de 128 KiB; agregue os dados."
+                    )
+                rows: list[tuple] = []
+                truncated = False
+                for row in cursor:
+                    if len(rows) == self.row_limit:
+                        truncated = True
+                        break
+                    rows.append(tuple(row))
+                    if _tool_output_size(columns, rows) > MAX_RESULT_BYTES:
+                        raise QueryError(
+                            "O resultado SQL excede o limite total de 128 KiB; agregue os dados."
+                        )
                 return QueryResult(
-                    columns=tuple(column[0] for column in cursor.description),
-                    rows=rows[: self.row_limit],
-                    truncated=len(rows) > self.row_limit,
+                    columns=columns,
+                    rows=tuple(rows),
+                    truncated=truncated,
                     elapsed_ms=round((perf_counter() - started) * 1000, 2),
                 )
         except sqlite3.Error as exc:
