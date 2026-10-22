@@ -40,23 +40,27 @@ def render_steps(steps: tuple[TraceStep, ...]) -> None:
     for index, step in enumerate(steps, start=1):
         if step.action == "inspect_schema":
             st.markdown(f"**{index}. Esquema do banco consultado**")
-            st.caption(step.purpose)
+            st.text(step.purpose)
             continue
 
-        st.markdown(f"**{index}. {step.purpose or 'Consulta SQL'}**")
+        st.markdown(f"**{index}. Consulta SQL**")
+        if step.purpose:
+            st.text(step.purpose)
         if step.sql:
             st.code(step.sql, language="sql")
         if step.error:
-            st.error(f"Consulta rejeitada: {step.error}")
+            st.error("Consulta rejeitada")
+            st.text(step.error)
         elif step.row_count is not None:
             st.caption(f"{step.row_count} linha(s) retornada(s)")
 
 
 def render_answer(answer: Answer) -> None:
     st.markdown("### Resposta")
-    st.write(answer.text)
+    st.text(answer.text)
     if answer.assumptions:
-        st.info(f"Interpretação usada: {answer.assumptions}")
+        st.info("Interpretação usada")
+        st.text(answer.assumptions)
 
     if answer.data is not None:
         st.markdown("### Dados consultados")
@@ -144,12 +148,13 @@ def main() -> None:
 
     if "question" in st.session_state:
         st.markdown("### Pergunta")
-        st.write(st.session_state.question)
+        st.text(st.session_state.question)
     if "answer" in st.session_state:
         render_answer(st.session_state.answer)
     elif "error" in st.session_state:
         error = st.session_state.error
-        st.error(str(error))
+        st.error("Não foi possível concluir")
+        st.text(str(error))
         if isinstance(error, AgentError) and error.steps:
             with st.expander("Ver consultas e passos", expanded=True):
                 render_steps(error.steps)

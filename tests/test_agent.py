@@ -40,7 +40,7 @@ def store(tmp_path):
             "CREATE TABLE eventos (id INTEGER PRIMARY KEY, canal TEXT);"
             "INSERT INTO eventos(canal) VALUES ('App'), ('WhatsApp');"
         )
-    return SQLiteReadOnly(path)
+    return SQLiteReadOnly(path, category_fields={("eventos", "canal")})
 
 
 def finish(*, answer="Existem 2 eventos.", query_number=1, chart="table"):
@@ -85,6 +85,20 @@ def test_recovers_from_invalid_sql_and_returns_evidence(store):
     )
 
 
+def test_default_budget_allows_two_sql_repairs_before_a_valid_answer(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        ("run_sql", {"sql": "SELECT missing_one FROM eventos", "purpose": "Tentar consulta"}),
+        ("run_sql", {"sql": "SELECT missing_two FROM eventos", "purpose": "Revisar consulta"}),
+        ("run_sql", {"sql": "SELECT COUNT(*) FROM eventos", "purpose": "Contar eventos"}),
+        finish(),
+    )
+
+    answer = DataAnalyst(store, model).ask("Quantos eventos existem?")
+    assert answer.data is not None
+    assert answer.data.rows == ((2,),)
+
+
 def test_can_run_multiple_queries_and_select_second_result(store):
     model = ScriptedModel(
         ("inspect_schema", {}),
@@ -106,6 +120,126 @@ def test_can_run_multiple_queries_and_select_second_result(store):
     assert answer.data.rows == (("App", 1), ("WhatsApp", 1))
     assert len(answer.steps) == 3
     assert answer.chart.kind == "bar"
+
+
+def test_retries_after_empty_group_instead_of_claiming_no_data(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": (
+                    "SELECT canal, COUNT(*) FROM eventos "
+                    "WHERE canal = 'App' AND canal = 'WhatsApp' GROUP BY canal"
+                ),
+                "purpose": "Contar o filtro inicial",
+            },
+        ),
+        finish(answer="Não há eventos no filtro."),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT canal, COUNT(*) FROM eventos WHERE canal = 'App' GROUP BY canal",
+                "purpose": "Usar o rótulo exato",
+            },
+        ),
+        finish(answer="Há um evento no App.", query_number=2),
+    )
+
+    answer = DataAnalyst(store, model).ask("Quantos eventos do App?")
+
+    assert answer.data is not None
+    assert answer.data.rows == (("App", 1),)
+    assert "um evento" in answer.text
+
+
+def test_retries_after_zero_scalar_before_claiming_no_data(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar",
+            },
+        ),
+        finish(answer="Nenhum evento."),
+        (
+            "run_sql",
+            {"sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App'", "purpose": "Recontar"},
+        ),
+        finish(answer="Há um evento.", query_number=2),
+    )
+
+    answer = DataAnalyst(store, model).ask("Quantos eventos do App?")
+
+    assert answer.data is not None
+    assert answer.data.rows == ((1,),)
+
+
+def test_accepts_confirmed_zero_after_category_distribution(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {"sql": "SELECT canal, COUNT(*) FROM eventos GROUP BY canal", "purpose": "Ver canais"},
+        ),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar interseção",
+            },
+        ),
+        finish(answer="Nenhum evento pertence simultaneamente aos dois canais.", query_number=2),
+    )
+
+    answer = DataAnalyst(store, model).ask("Há eventos simultaneamente nos dois canais?")
+
+    assert answer.data is not None
+    assert answer.data.rows == ((0,),)
+
+
+def test_unrelated_table_count_does_not_verify_zero(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.executescript(
+            "CREATE TABLE outros (id INTEGER PRIMARY KEY); INSERT INTO outros VALUES (1);"
+        )
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        ("run_sql", {"sql": "SELECT COUNT(*) FROM outros", "purpose": "Contar outros"}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar interseção",
+            },
+        ),
+        finish(answer="Nenhum evento.", query_number=2),
+        finish(answer="Nenhum evento.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(store, model).ask("Há eventos simultaneamente nos dois canais?")
+
+
+def test_same_table_total_count_is_not_a_distribution_or_date_verification(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        ("run_sql", {"sql": "SELECT COUNT(*) FROM eventos", "purpose": "Contar total"}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar interseção",
+            },
+        ),
+        finish(answer="Nenhum evento.", query_number=2),
+        finish(answer="Nenhum evento.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(store, model).ask("Há eventos simultaneamente nos dois canais?")
 
 
 def test_refuses_final_answer_without_query_evidence(store):
@@ -140,6 +274,21 @@ def test_stops_after_sql_error_limit(store):
 
     with pytest.raises(AgentError, match="limite"):
         DataAnalyst(store, model, max_sql_errors=2).ask("Quantos?")
+
+
+def test_default_error_budget_allows_three_repairs_before_success(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        ("run_sql", {"sql": "SELEC 1", "purpose": "Tentativa 1"}),
+        ("run_sql", {"sql": "SELEC 2", "purpose": "Tentativa 2"}),
+        ("run_sql", {"sql": "SELEC 3", "purpose": "Tentativa 3"}),
+        ("run_sql", {"sql": "SELECT COUNT(*) FROM eventos", "purpose": "Corrigir"}),
+        finish(),
+    )
+
+    answer = DataAnalyst(store, model).ask("Quantos eventos existem?")
+    assert answer.data is not None
+    assert answer.data.rows == ((2,),)
 
 
 def test_rejects_empty_question(store):

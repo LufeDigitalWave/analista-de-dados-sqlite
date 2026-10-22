@@ -3,6 +3,9 @@
 import json
 from typing import Protocol
 
+import sqlglot
+from sqlglot import exp
+
 from .database import QueryError, SQLiteReadOnly
 from .models import Answer, ChartSpec, ModelTurn, QueryResult, TraceStep
 
@@ -13,6 +16,10 @@ class AgentError(RuntimeError):
     def __init__(self, message: str, steps: tuple[TraceStep, ...] = ()) -> None:
         super().__init__(message)
         self.steps = steps
+
+
+class _UnverifiedEmptyResult(AgentError):
+    """A zero result needs another independent check before it can support an answer."""
 
 
 class Model(Protocol):
@@ -27,7 +34,7 @@ class DataAnalyst:
         db: SQLiteReadOnly,
         model: Model,
         max_turns: int = 8,
-        max_sql_errors: int = 2,
+        max_sql_errors: int = 4,
     ) -> None:
         if max_turns < 1 or max_sql_errors < 1:
             raise ValueError("Os limites de execução devem ser positivos.")
@@ -46,8 +53,10 @@ class DataAnalyst:
         history: list = [{"role": "user", "content": clean_question}]
         steps: list[TraceStep] = []
         successful_queries: list[QueryResult] = []
+        successful_sql: list[str] = []
         schema_seen = False
         sql_errors = 0
+        empty_finishes = 0
 
         for _ in range(self.max_turns):
             try:
@@ -62,9 +71,18 @@ class DataAnalyst:
             call = turn.call
 
             if call.name == "finish_answer":
-                return self._finish(call.arguments, successful_queries, steps)
+                try:
+                    return self._finish(call.arguments, successful_queries, successful_sql, steps)
+                except _UnverifiedEmptyResult as exc:
+                    empty_finishes += 1
+                    if empty_finishes >= 2:
+                        raise AgentError(
+                            "Não foi possível confirmar o resultado vazio após nova tentativa.",
+                            tuple(steps),
+                        ) from exc
+                    payload = {"ok": False, "error": str(exc)}
 
-            if call.name == "inspect_schema":
+            elif call.name == "inspect_schema":
                 try:
                     schema = self.db.inspect_schema()
                 except Exception as exc:
@@ -101,6 +119,7 @@ class DataAnalyst:
                         ) from exc
                 else:
                     successful_queries.append(result)
+                    successful_sql.append(sql)
                     query_number = len(successful_queries)
                     steps.append(
                         TraceStep(
@@ -135,6 +154,7 @@ class DataAnalyst:
     def _finish(
         arguments: dict,
         successful_queries: list[QueryResult],
+        successful_sql: list[str],
         steps: list[TraceStep],
     ) -> Answer:
         answer = arguments.get("answer")
@@ -150,6 +170,20 @@ class DataAnalyst:
             result = None
         elif 1 <= query_number <= len(successful_queries):
             result = successful_queries[query_number - 1]
+            if _is_empty_evidence(result) and (
+                query_number != len(successful_queries)
+                or not _has_related_verification(
+                    successful_queries[: query_number - 1],
+                    successful_sql[: query_number - 1],
+                    successful_sql[query_number - 1],
+                )
+            ):
+                raise _UnverifiedEmptyResult(
+                    "Resultado vazio ou zero ainda não confirmado. Revise filtros, valores "
+                    "categóricos e período; consulte distribuição ou datas da mesma fonte "
+                    "e execute novamente antes de concluir.",
+                    tuple(steps),
+                )
         else:
             raise AgentError("A resposta não aponta para uma consulta de evidência.", tuple(steps))
 
@@ -179,6 +213,41 @@ class DataAnalyst:
 
 def _text_or_empty(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _is_empty_evidence(result: QueryResult) -> bool:
+    if not result.rows:
+        return True
+    if len(result.rows) != 1:
+        return False
+    values = result.rows[0]
+    return bool(values) and all(
+        value is None or (isinstance(value, (int, float)) and value == 0) for value in values
+    )
+
+
+def _has_related_verification(
+    previous_results: list[QueryResult], previous_sql: list[str], selected_sql: str
+) -> bool:
+    """Require a related distribution or date-bound probe before a zero claim."""
+    try:
+        target = sqlglot.parse_one(selected_sql, read="sqlite")
+        target_tables = {table.name.casefold() for table in target.find_all(exp.Table)}
+        for result, sql in zip(previous_results, previous_sql, strict=True):
+            if _is_empty_evidence(result):
+                continue
+            probe = sqlglot.parse_one(sql, read="sqlite")
+            probe_tables = {table.name.casefold() for table in probe.find_all(exp.Table)}
+            if target_tables & probe_tables and (
+                probe.find(exp.Group) is not None
+                or probe.find(exp.Max) is not None
+                or probe.find(exp.Min) is not None
+            ):
+                return True
+    except Exception:
+        # Validation failures here must only make a zero answer harder to claim.
+        return False
+    return False
 
 
 def _json_safe(value: object) -> str:

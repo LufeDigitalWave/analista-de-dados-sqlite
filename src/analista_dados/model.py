@@ -12,7 +12,10 @@ _TOOLS = [
     {
         "type": "function",
         "name": "inspect_schema",
-        "description": "Descobre tabelas, colunas e chaves estrangeiras do SQLite, sem ler dados.",
+        "description": (
+            "Descobre tabelas, colunas e chaves estrangeiras do SQLite; "
+            "inclui contagens de valores categóricos seguros, quando disponíveis."
+        ),
         "strict": True,
         "parameters": {
             "type": "object",
@@ -25,8 +28,11 @@ _TOOLS = [
         "type": "function",
         "name": "run_sql",
         "description": (
-            "Executa uma consulta SQLite somente leitura. Informe o SQL e uma frase "
-            "curta descrevendo o objetivo operacional da consulta."
+            "Executa uma consulta SQLite somente leitura e agregada. Retorne só métricas, "
+            "dimensões categóricas aprovadas ou mês de evento; use IDs apenas em JOINs "
+            "e COUNT(DISTINCT). Para período relativo use MAX(date(coluna_data)) em CTE; "
+            "DATE(data literal) e MAX(data crua) são recusados. "
+            "Informe SQL e objetivo operacional curto."
         ),
         "strict": True,
         "parameters": {

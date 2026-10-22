@@ -4,11 +4,14 @@ import json
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Iterable
 from contextlib import closing
+from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
 
 from .models import QueryResult
+from .sql_policy import SQLPolicyError, validate_sql
 
 PROTECTED_TOKENS = frozenset({"email", "cpf", "telefone", "endereco", "celular"})
 ALLOWED_ACTIONS = frozenset(
@@ -17,6 +20,31 @@ ALLOWED_ACTIONS = frozenset(
 DENIED_FUNCTIONS = frozenset({"load_extension", "readfile", "writefile", "randomblob", "zeroblob"})
 MAX_VALUE_BYTES = 64 * 1024
 MAX_RESULT_BYTES = 128 * 1024
+MAX_CATEGORY_VALUES = 30
+DEFAULT_CATEGORY_FIELDS = frozenset(
+    {
+        ("clientes", "estado"),
+        ("compras", "canal"),
+        ("compras", "categoria"),
+        ("campanhas_marketing", "canal"),
+        ("suporte", "canal"),
+        ("suporte", "tipo_contato"),
+    }
+)
+
+
+def _sqlite_affinity(declared_type: str) -> str:
+    """Expose SQLite affinity, not the free-form declared type, to the model."""
+    upper = declared_type.upper()
+    if "INT" in upper:
+        return "INTEGER"
+    if any(token in upper for token in ("CHAR", "CLOB", "TEXT")):
+        return "TEXT"
+    if "BLOB" in upper or not upper:
+        return "BLOB"
+    if any(token in upper for token in ("REAL", "FLOA", "DOUB")):
+        return "REAL"
+    return "NUMERIC"
 
 
 def _is_protected_column(column: str) -> bool:
@@ -55,12 +83,22 @@ def _tool_output_size(columns: tuple[str, ...], rows: list[tuple]) -> int:
     )
 
 
+def _schema_output_size(schema: dict) -> int:
+    return len(json.dumps({"ok": True, "schema": schema}, ensure_ascii=True))
+
+
 class QueryError(ValueError):
     """A proposed query was rejected or could not be executed safely."""
 
 
 class SQLiteReadOnly:
-    def __init__(self, path: Path, row_limit: int = 200, timeout_seconds: float = 3.0):
+    def __init__(
+        self,
+        path: Path,
+        row_limit: int = 200,
+        timeout_seconds: float = 3.0,
+        category_fields: Iterable[tuple[str, str]] | None = None,
+    ):
         if not 1 <= row_limit <= 200:
             raise ValueError("row_limit deve estar entre 1 e 200.")
         if timeout_seconds <= 0:
@@ -68,21 +106,51 @@ class SQLiteReadOnly:
         self.path = Path(path)
         self.row_limit = row_limit
         self.timeout_seconds = timeout_seconds
+        approved = DEFAULT_CATEGORY_FIELDS if category_fields is None else category_fields
+        self.category_fields = frozenset(
+            (table.casefold(), column.casefold()) for table, column in approved
+        )
+        self._schema_cache: tuple[tuple[int, int, int, int], dict] | None = None
 
     def inspect_schema(self) -> dict:
         try:
+            stat = self.path.stat()
+            try:
+                wal_stat = Path(f"{self.path}-wal").stat()
+                wal_fingerprint = (wal_stat.st_size, wal_stat.st_mtime_ns)
+            except FileNotFoundError:
+                wal_fingerprint = (-1, -1)
+        except OSError as exc:
+            raise QueryError("Banco SQLite não encontrado.") from exc
+        fingerprint = (stat.st_size, stat.st_mtime_ns, *wal_fingerprint)
+        if self._schema_cache is not None and self._schema_cache[0] == fingerprint:
+            return deepcopy(self._schema_cache[1])
+
+        deadline = perf_counter() + self.timeout_seconds
+        time_expired = False
+
+        def check_deadline() -> int:
+            nonlocal time_expired
+            time_expired = perf_counter() >= deadline
+            return int(time_expired)
+
+        try:
             with closing(self._connect()) as connection:
+                connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+                connection.set_progress_handler(check_deadline, 1000)
+                if check_deadline():
+                    raise QueryError("Leitura do schema interrompida por limite de tempo.")
                 names = connection.execute(
                     "SELECT name FROM sqlite_master "
                     "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
                 ).fetchall()
-                tables = []
+                schema: dict = {"tables": []}
                 for (name,) in names:
                     quoted = '"' + name.replace('"', '""') + '"'
                     columns = [
                         {
                             "name": row[1],
-                            "type": row[2],
+                            "type": _sqlite_affinity(row[2]),
                             "nullable": not bool(row[3] or row[5]),
                             "primary_key": bool(row[5]),
                         }
@@ -92,15 +160,66 @@ class SQLiteReadOnly:
                         {"table": row[2], "from": row[3], "to": row[4]}
                         for row in connection.execute(f"PRAGMA foreign_key_list({quoted})")
                     ]
-                    tables.append({"name": name, "columns": columns, "foreign_keys": foreign_keys})
+                    table: dict = {
+                        "name": name,
+                        "columns": columns,
+                        "foreign_keys": foreign_keys,
+                    }
+                    categorical_values = {}
+                    for column in columns:
+                        category_name = column["name"]
+                        if (
+                            (name.casefold(), category_name.casefold()) not in self.category_fields
+                            or column["primary_key"]
+                            or category_name.casefold().endswith("_id")
+                            or _is_protected_column(category_name)
+                            or column["type"] != "TEXT"
+                        ):
+                            continue
+                        quoted_column = '"' + category_name.replace('"', '""') + '"'
+                        categories = connection.execute(
+                            f"SELECT {quoted_column}, COUNT(*) FROM {quoted} "
+                            f"WHERE {quoted_column} IS NOT NULL GROUP BY {quoted_column} "
+                            f"ORDER BY COUNT(*) DESC, {quoted_column} LIMIT ?",
+                            (MAX_CATEGORY_VALUES + 1,),
+                        ).fetchall()
+                        if len(categories) <= MAX_CATEGORY_VALUES and all(
+                            isinstance(value, str)
+                            and len(value) <= 80
+                            and value.isprintable()
+                            and "@" not in value
+                            and not any(character.isdigit() for character in value)
+                            and "://" not in value
+                            and "www." not in value.casefold()
+                            for value, _ in categories
+                        ):
+                            categorical_values[category_name] = [
+                                {"value": value, "count": count} for value, count in categories
+                            ]
+                    if categorical_values:
+                        table["categorical_values"] = categorical_values
+                    schema["tables"].append(table)
+                    if _schema_output_size(schema) > MAX_RESULT_BYTES:
+                        raise QueryError(
+                            "O schema excede o limite total de 128 KiB; use um banco menor."
+                        )
+                    if check_deadline():
+                        raise QueryError("Leitura do schema interrompida por limite de tempo.")
         except sqlite3.Error as exc:
+            if time_expired:
+                raise QueryError("Leitura do schema interrompida por limite de tempo.") from exc
             raise QueryError("Não foi possível ler o schema do banco SQLite.") from exc
-        return {"tables": tables}
+        self._schema_cache = (fingerprint, schema)
+        return deepcopy(schema)
 
     def run_sql(self, sql: str) -> QueryResult:
         statement = sql.strip()
         if not re.match(r"^(?:SELECT|WITH)\b", statement, re.IGNORECASE):
             raise QueryError("Apenas consultas SELECT/WITH são permitidas.")
+        try:
+            validate_sql(statement, self.inspect_schema())
+        except SQLPolicyError as exc:
+            raise QueryError(str(exc)) from exc
         started = perf_counter()
         deadline = started + self.timeout_seconds
         blocked: list[str] = []
