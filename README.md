@@ -3,6 +3,7 @@
 Implementação do **Desafio Técnico 1**: um assistente que recebe perguntas em português, descobre o esquema do banco em tempo de execução, consulta SQLite e apresenta resposta, dados, gráfico quando pertinente e as consultas executadas. Não há SQL pronto para as perguntas do enunciado no código da aplicação.
 
 A [especificação de estabilização](docs/superpowers/specs/2026-10-22-estabilizacao-case-design.md) e o [plano de tarefas](docs/superpowers/plans/2026-10-22-estabilizacao-case.md) registram escopo, critérios de aceite, riscos e verificações desta entrega.
+O [fechamento verificável](docs/superpowers/specs/2026-10-22-fechamento-evidencias-design.md) e seu [plano de execução](docs/superpowers/plans/2026-10-22-fechamento-evidencias.md) documentam a revisão manual das cinco perguntas e os limites da evidência.
 O [estado consolidado da entrega](docs/STATUS-ENTREGA.md) separa evidência verificada, revisão pendente e limites do protótipo.
 
 ## Executar
@@ -85,6 +86,8 @@ python -m evals.live_eval
 ```
 
 O comando imprime apenas estado, contagens agregadas e identificadores hash das consultas; não imprime SQL, linhas privadas nem a chave. Encerra com código 0 somente quando os cinco casos passam.
+
+Para uma **nova rodada paga** com evidência local de revisão, use `python -m evals.live_eval --private-review` com as mesmas variáveis de ambiente. Essa opção exige um commit local e árvore Git limpa antes e depois, registra hash do banco e cria um JSON novo em `work/private-review/` fora de `outputs/` neste workspace; em clone comum, exige que o Git ignore o destino. O arquivo pode conter texto, SQL e resultados agregados sensíveis. **Não o inclua no Git, ZIP ou e-mail.** O comando normal, sem a opção, não cria esse pacote. Os veredictos automáticos não substituem conferir pergunta, SQL, tabela e redação.
 
 Na última execução integral de 22/10/2026 com o banco anexo e `gpt-4.1`, os agregados das cinco respostas coincidiram com os oráculos independentes. O gate conservador marcou **5 REVIEW**, todos por afirmações no texto não comprovadas automaticamente, sem `FAIL` nessa execução. A quinta série teve 38 linhas e totalizou as 97 reclamações do período. `REVIEW` não é aprovação automática nem erro comprovado: confira a trilha SQL e a tabela. A trajetória do modelo varia: uma execução anterior nesta revisão teve divergência comprovada na pergunta 2 (`FAIL`) e formato de tabela não reconhecido na 3 (`REVIEW`). Após reforço geral do prompt, a pergunta 2 passou em teste dirigido e voltou a coincidir na rodada integral. Portanto, não há garantia de acerto estável em toda tentativa. O teste de navegador após estas correções é registrado separadamente no relatório da entrega.
 

@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import io
+import json
 import sqlite3
 
 import pytest
 
 from analista_dados.models import Answer, ChartSpec, ModelTurn, QueryResult, ToolCall
 from analista_dados.visualization import prepare_visualization
+from evals import private_review
 from evals.live_eval import (
     QUESTIONS,
     RecordingSQLite,
+    _private_case_record,
     assess_case,
     load_reference_rows,
     main,
@@ -190,6 +193,66 @@ def test_q2_wrong_narrative_cannot_pass_with_correct_data() -> None:
     outcome = assess_case(2, _answer(2, text="Foram 18 clientes em 2024."), REFERENCES[1], SQL[1])
     assert outcome.status == "FAIL"
     assert "answer_text_mismatch" in outcome.issues
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Foram 17 clientes distintos entre 01/01/2024 e 31/12/2024.",
+        "Foram 17 clientes distintos entre 2024-01-01 e 2024-12-31.",
+        "Foram 17 clientes distintos de 01/01/2024 até 31/12/2024.",
+    ),
+)
+def test_q2_full_2024_dates_are_period_not_extra_client_counts(text: str) -> None:
+    outcome = assess_case(2, _answer(2, text=text), REFERENCES[1], SQL[1])
+
+    assert outcome.status == "PASS", outcome.issues
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Foram 17 clientes distintos que interagiram no WhatsApp em 2025.",
+        "Foram 17 clientes distintos entre 02/01/2024 e 31/12/2024.",
+        "Foram 17 clientes distintos entre 31/12/2024 e 01/01/2024.",
+        "Foram 17 clientes distintos entre 01/01/2024 e 31/12/2025.",
+        "Foram 17 clientes distintos em 01/01/2024 e 31/12/2024.",
+        "Foram 17 clientes distintos nos dias 01/01/2024 e 31/12/2024.",
+        "Foram 17 clientes distintos, mas não entre 01/01/2024 e 31/12/2024.",
+        "Foram 17 clientes distintos entre 01/01/2024 e 31/12/2024; 3 voltaram.",
+        "Foram 17 clientes distintos entre 01/01/2024 e 31/12/2024; talvez 18.",
+        "Foram 17,5 clientes distintos em 2024.",
+        "Foram 17.5 clientes distintos em 2024.",
+    ),
+)
+def test_q2_wrong_or_ambiguous_period_or_extra_count_never_passes(text: str) -> None:
+    outcome = assess_case(2, _answer(2, text=text), REFERENCES[1], SQL[1])
+
+    assert outcome.status != "PASS", outcome.issues
+
+
+def test_q2_wrong_total_with_full_dates_still_fails() -> None:
+    outcome = assess_case(
+        2,
+        _answer(2, text="Foram 18 clientes distintos entre 01/01/2024 e 31/12/2024."),
+        REFERENCES[1],
+        SQL[1],
+    )
+
+    assert outcome.status == "FAIL", outcome.issues
+    assert "answer_text_mismatch" in outcome.issues
+
+
+def test_q2_spelled_out_total_with_full_dates_requires_review() -> None:
+    outcome = assess_case(
+        2,
+        _answer(2, text="Foram dezessete clientes entre 01/01/2024 e 31/12/2024."),
+        REFERENCES[1],
+        SQL[1],
+    )
+
+    assert outcome.status == "REVIEW", outcome.issues
+    assert "answer_text_review" in outcome.issues
 
 
 @pytest.mark.parametrize(
@@ -833,3 +896,374 @@ def test_main_without_credentials_stops_before_provider(monkeypatch, tmp_path) -
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "missing.db"))
     assert main(["2"]) == 3
+
+
+def _synthetic_q2_database(tmp_path):
+    path = tmp_path / "synthetic.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE campanhas_marketing "
+            "(cliente_id INTEGER, canal TEXT, interagiu INTEGER, data_envio TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO campanhas_marketing VALUES (?, 'WhatsApp', 1, '2024-06-01')",
+            [(index,) for index in range(17)],
+        )
+    return path
+
+
+def _scripted_q2_model(_case: int) -> _ScriptedModel:
+    return _ScriptedModel(
+        [
+            _turn("inspect_schema", {}, 1),
+            _turn("run_sql", {"sql": SQL[1], "purpose": "Contar clientes"}, 2),
+            _turn(
+                "finish_answer",
+                {
+                    "answer": ANSWERS[1] + " MARCADOR_PRIVADO_SINTETICO",
+                    "query_number": 1,
+                    "visualization": "table",
+                    "x_column": "",
+                    "y_column": "",
+                    "series_column": "",
+                    "assumptions": [],
+                },
+                3,
+            ),
+        ]
+    )
+
+
+def _private_review_test_root(monkeypatch, tmp_path):
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    repo = outputs / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(private_review, "REPO_ROOT", repo)
+    monkeypatch.setattr(private_review, "git_state", lambda: ("a" * 40, False))
+    return repo
+
+
+def test_private_review_is_opt_in_and_preserves_redacted_console(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    plain_output = io.StringIO()
+
+    plain_code = run_evaluation(
+        db_path, REFERENCES, _scripted_q2_model, selected=(2,), out=plain_output
+    )
+
+    assert plain_code == 0
+    assert not (tmp_path / "work").exists()
+    assert "MARCADOR_PRIVADO_SINTETICO" not in plain_output.getvalue()
+
+    private_output = io.StringIO()
+    private_code = run_evaluation(
+        db_path,
+        REFERENCES,
+        _scripted_q2_model,
+        selected=(2,),
+        private_review=True,
+        model_name="synthetic",
+        out=private_output,
+    )
+
+    assert private_code == 0
+    bundles = list((tmp_path / "work" / "private-review").glob("*.json"))
+    assert len(bundles) == 1
+    bundle = json.loads(bundles[0].read_text(encoding="utf-8"))
+    assert bundle["format_version"] == 1
+    assert bundle["commit"] == "a" * 40
+    assert bundle["dirty"] is False
+    assert bundle["model"] == "synthetic"
+    assert bundle["selected_cases"] == [2]
+    assert bundle["attempted_cases"] == [2]
+    assert bundle["completed_cases"] == 1
+    assert bundle["error_code"] is None
+    assert bundle["database_sha256_before"] == bundle["database_sha256_after"]
+    record = bundle["cases"][0]
+    assert record["status"] == "PASS"
+    assert record["answer_text"] == ANSWERS[1] + " MARCADOR_PRIVADO_SINTETICO"
+    assert record["selected_sql"] == SQL[1]
+    assert record["successful_sql"] == [SQL[1]]
+    assert record["result_columns"] == ["clientes"]
+    assert record["result_rows"] == [[17]]
+    assert "MARCADOR_PRIVADO_SINTETICO" not in private_output.getvalue()
+    assert SQL[1] not in private_output.getvalue()
+    assert str(db_path) not in bundles[0].read_text(encoding="utf-8")
+
+
+def test_private_review_partial_error_redacts_exception_text(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+
+    def model_factory(case: int):
+        if case == 2:
+            return _scripted_q2_model(case)
+        raise RuntimeError("PRIVATE_EXCEPTION_SENTINEL")
+
+    output = io.StringIO()
+    code = run_evaluation(
+        db_path,
+        REFERENCES,
+        model_factory,
+        selected=(2, 3, 4),
+        private_review=True,
+        model_name="synthetic",
+        out=output,
+    )
+
+    assert code == 1
+    bundle_path = next((tmp_path / "work" / "private-review").glob("*.json"))
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle["selected_cases"] == [2, 3, 4]
+    assert bundle["attempted_cases"] == [2, 3]
+    assert bundle["completed_cases"] == 1
+    assert bundle["error_code"] == "execution_RuntimeError"
+    assert bundle["cases"][1]["status"] == "FAIL"
+    assert bundle["cases"][1]["answer_text"] is None
+    assert bundle["cases"][1]["selected_sql"] is None
+    assert bundle["cases"][1]["actual_row_count"] is None
+    assert "PRIVATE_EXCEPTION_SENTINEL" not in bundle_path.read_text(encoding="utf-8")
+    assert "PRIVATE_EXCEPTION_SENTINEL" not in output.getvalue()
+
+
+def test_private_review_distinguishes_empty_result_from_missing_result(tmp_path) -> None:
+    answer = _answer(2, rows=())
+    outcome = assess_case(2, answer, REFERENCES[1], SQL[1])
+
+    record = _private_case_record(
+        2, outcome, answer, SQL[1], RecordingSQLite(tmp_path / "synthetic.db")
+    )
+
+    assert record["actual_row_count"] == 0
+
+
+def test_private_review_mismatched_aggregate_does_not_store_rows(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    references = list(REFERENCES)
+    references[1] = ((18,),)
+
+    code = run_evaluation(
+        db_path,
+        references,
+        _scripted_q2_model,
+        selected=(2,),
+        private_review=True,
+        out=io.StringIO(),
+    )
+
+    assert code == 1
+    bundle_path = next((tmp_path / "work" / "private-review").glob("*.json"))
+    record = json.loads(bundle_path.read_text(encoding="utf-8"))["cases"][0]
+    assert record["aggregate_match"] is False
+    assert record["actual_row_count"] == 1
+    assert record["result_rows"] is None
+    assert record["result_columns"] is None
+
+
+def test_private_review_write_failure_is_not_reported_as_success(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+
+    def fail_write(_payload):
+        raise OSError("PRIVATE_FILE_ERROR_SENTINEL")
+
+    monkeypatch.setattr(private_review, "write_private_review", fail_write)
+    output = io.StringIO()
+    code = run_evaluation(
+        db_path,
+        REFERENCES,
+        _scripted_q2_model,
+        selected=(2,),
+        private_review=True,
+        out=output,
+    )
+
+    assert code == 3
+    assert "PRIVATE_REVIEW_FAIL" in output.getvalue()
+    assert "PRIVATE_FILE_ERROR_SENTINEL" not in output.getvalue()
+
+
+def test_private_review_preflight_failure_creates_no_bundle(monkeypatch, tmp_path) -> None:
+    _private_review_test_root(monkeypatch, tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "missing.db"))
+
+    assert main(["--private-review", "2"]) == 3
+    assert not (tmp_path / "work").exists()
+
+
+def test_private_review_empty_selected_reference_stops_before_model_and_bundle(
+    monkeypatch, tmp_path
+) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    references = list(REFERENCES)
+    references[1] = ()
+    called_cases: list[int] = []
+
+    def model_factory(case: int):
+        called_cases.append(case)
+        return _scripted_q2_model(case)
+
+    output = io.StringIO()
+    code = run_evaluation(
+        db_path,
+        references,
+        model_factory,
+        selected=(2,),
+        private_review=True,
+        out=output,
+    )
+
+    assert code == 3
+    assert called_cases == []
+    assert "REFERENCE_FAIL: empty_reference" in output.getvalue()
+    assert not (tmp_path / "work").exists()
+
+
+def test_main_empty_selected_reference_stops_before_provider(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-only")
+    references = list(REFERENCES)
+    references[1] = ()
+    monkeypatch.setattr("evals.live_eval.load_reference_rows", lambda _path: references)
+
+    def forbidden_provider(**_kwargs):
+        raise AssertionError("PROVIDER_MUST_NOT_START")
+
+    monkeypatch.setattr("openai.OpenAI", forbidden_provider)
+
+    assert main(["--private-review", "2"]) == 3
+    assert not (tmp_path / "work").exists()
+
+
+def test_private_review_dirty_tree_stops_before_model_call(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    monkeypatch.setattr(private_review, "git_state", lambda: ("a" * 40, True))
+
+    def model_factory(_case: int):
+        raise AssertionError("MODEL_SHOULD_NOT_BE_CALLED")
+
+    output = io.StringIO()
+    code = run_evaluation(
+        db_path,
+        REFERENCES,
+        model_factory,
+        selected=(2,),
+        private_review=True,
+        out=output,
+    )
+
+    assert code == 3
+    assert "dirty_tree" in output.getvalue()
+    assert "MODEL_SHOULD_NOT_BE_CALLED" not in output.getvalue()
+    assert not list((tmp_path / "work" / "private-review").glob("*.json"))
+
+
+def test_private_review_changed_database_is_not_complete(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    hashes = iter(("a" * 64, "b" * 64))
+    monkeypatch.setattr(private_review, "sha256_file", lambda _path: next(hashes))
+
+    output = io.StringIO()
+    code = run_evaluation(
+        db_path,
+        REFERENCES,
+        _scripted_q2_model,
+        selected=(2,),
+        private_review=True,
+        out=output,
+    )
+
+    assert code == 3
+    bundle_path = next((tmp_path / "work" / "private-review").glob("*.json"))
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle["database_sha256_before"] == "a" * 64
+    assert bundle["database_sha256_after"] == "b" * 64
+    assert bundle["integrity_issues"] == ["database_changed"]
+    assert "database_changed" in output.getvalue()
+
+
+def test_private_review_changed_source_is_not_reproducible(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    states = iter((("a" * 40, False), ("a" * 40, True)))
+    monkeypatch.setattr(private_review, "git_state", lambda: next(states))
+
+    output = io.StringIO()
+    code = run_evaluation(
+        db_path,
+        REFERENCES,
+        _scripted_q2_model,
+        selected=(2,),
+        private_review=True,
+        out=output,
+    )
+
+    assert code == 3
+    bundle_path = next((tmp_path / "work" / "private-review").glob("*.json"))
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle["commit_after"] == "a" * 40
+    assert bundle["dirty_after"] is True
+    assert bundle["integrity_issues"] == ["source_changed"]
+    assert "source_changed" in output.getvalue()
+
+
+def test_private_review_keyboard_interrupt_saves_categorical_failure(monkeypatch, tmp_path) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+
+    def model_factory(_case: int):
+        raise KeyboardInterrupt
+
+    output = io.StringIO()
+    code = run_evaluation(
+        db_path,
+        REFERENCES,
+        model_factory,
+        selected=(2,),
+        private_review=True,
+        out=output,
+    )
+
+    assert code == 1
+    bundle_path = next((tmp_path / "work" / "private-review").glob("*.json"))
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle["attempted_cases"] == [2]
+    assert bundle["completed_cases"] == 0
+    assert bundle["error_code"] == "execution_KeyboardInterrupt"
+    assert bundle["cases"][0]["answer_text"] is None
+
+
+def test_private_review_keeps_execution_error_if_database_also_changes(
+    monkeypatch, tmp_path
+) -> None:
+    db_path = _synthetic_q2_database(tmp_path)
+    _private_review_test_root(monkeypatch, tmp_path)
+    hashes = iter(("a" * 64, "b" * 64))
+    monkeypatch.setattr(private_review, "sha256_file", lambda _path: next(hashes))
+
+    def model_factory(_case: int):
+        raise RuntimeError("PRIVATE_EXCEPTION_SENTINEL")
+
+    code = run_evaluation(
+        db_path,
+        REFERENCES,
+        model_factory,
+        selected=(2,),
+        private_review=True,
+        out=io.StringIO(),
+    )
+
+    assert code == 3
+    bundle_path = next((tmp_path / "work" / "private-review").glob("*.json"))
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle["error_code"] == "execution_RuntimeError"
+    assert bundle["integrity_issues"] == ["database_changed"]

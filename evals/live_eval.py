@@ -23,7 +23,8 @@ import sys
 import unicodedata
 from collections.abc import Callable, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -34,6 +35,7 @@ from analista_dados.agent import DataAnalyst
 from analista_dados.database import SQLiteReadOnly
 from analista_dados.models import Answer, QueryResult
 from analista_dados.visualization import prepare_visualization
+from evals import private_review as private_review_store
 
 QUESTIONS = (
     "Liste os 5 estados com maior número de clientes que compraram via app em maio.",
@@ -222,10 +224,38 @@ def _label_number_verdict(text: str, label: str, expected: float, labels: Sequen
 
 
 def _text_integer_verdict(text: str, expected: int, *, exclude_years: bool) -> str:
+    folded = _fold(text)
+    if exclude_years:
+        full_date = re.compile(r"(?<!\d)(?:\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})(?!\d)")
+        matches = list(full_date.finditer(folded))
+        dates = []
+        for match in matches:
+            value = match.group()
+            if "/" in value:
+                day, month, year = value.split("/")
+                value = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+            dates.append(value)
+        if dates:
+            if dates != ["2024-01-01", "2024-12-31"]:
+                return "ambiguous"
+            before_start = folded[: matches[0].start()]
+            between_dates = folded[matches[0].end() : matches[1].start()]
+            is_between = re.search(r"\bentre\s*$", before_start) and re.fullmatch(
+                r"\s+e\s+", between_dates
+            )
+            is_from_to = re.search(r"\bde\s*$", before_start) and re.fullmatch(
+                r"\s+(?:a|ate)\s+", between_dates
+            )
+            if not (is_between or is_from_to):
+                return "ambiguous"
+            clause_start = max(before_start.rfind(separator) for separator in (".", ";", "\n")) + 1
+            if re.search(r"\b(?:nao|nunca|jamais)\b", before_start[clause_start:]):
+                return "ambiguous"
+            folded = full_date.sub(" ", folded)
     numbers = [
         int(number)
-        for number in re.findall(r"(?<![\d,.])[+-]?\d+(?![\d,.])", _fold(text))
-        if not exclude_years or number not in {"2024", "2025"}
+        for number in re.findall(r"(?<![\d,.])[+-]?\d+(?!\d|[,.]\d)", folded)
+        if not exclude_years or number != "2024"
     ]
     if expected in numbers:
         return "ambiguous" if any(number != expected for number in numbers) else "ok"
@@ -1019,6 +1049,32 @@ def _reference_summary(case: int, reference: Sequence[tuple]) -> str:
     return f"rows={len(reference)}"
 
 
+def _private_case_record(
+    case: int,
+    outcome: CaseAssessment,
+    answer: Answer | None,
+    selected_sql: str | None,
+    db: RecordingSQLite,
+) -> dict[str, object]:
+    result = answer.data if answer is not None else None
+    matching_result = result is not None and outcome.aggregate_match
+    return {
+        "case": case,
+        "question": QUESTIONS[case - 1],
+        "status": outcome.status,
+        "issues": list(outcome.issues),
+        "aggregate_match": outcome.aggregate_match,
+        "answer_text": answer.text if answer is not None else None,
+        "assumptions": answer.assumptions if answer is not None else None,
+        "selected_sql": selected_sql,
+        "successful_sql": [sql for sql, _result in db.successful_queries],
+        "chart": asdict(answer.chart) if answer is not None else None,
+        "actual_row_count": len(result.rows) if result is not None else None,
+        "result_columns": list(result.columns) if matching_result else None,
+        "result_rows": [list(row) for row in result.rows] if matching_result else None,
+    }
+
+
 def run_evaluation(
     db_path: Path,
     references: Sequence[Sequence[tuple]],
@@ -1026,31 +1082,82 @@ def run_evaluation(
     *,
     selected: Sequence[int] = (1, 2, 3, 4, 5),
     out: TextIO = sys.stdout,
+    private_review: bool = False,
+    model_name: str = "unknown",
 ) -> int:
     """Run real DataAnalyst/SQLiteReadOnly with an injectable offline model."""
     if len(references) != 5 or any(case not in range(1, 6) for case in selected):
         raise ValueError("São necessários cinco oráculos e casos entre 1 e 5.")
+    if any(not references[case - 1] for case in selected):
+        print("REFERENCE_FAIL: empty_reference", file=out)
+        return 3
+    bundle: dict[str, object] | None = None
+    if private_review:
+        try:
+            private_review_store.prepare_private_review()
+            commit, dirty = private_review_store.git_state()
+            if dirty:
+                print("PRIVATE_REVIEW_FAIL: dirty_tree", file=out)
+                return 3
+            initial_hash = private_review_store.sha256_file(db_path)
+        except Exception as exc:
+            print(f"PRIVATE_REVIEW_FAIL: {type(exc).__name__}", file=out)
+            return 3
+        bundle = {
+            "format_version": 1,
+            "created_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "commit": commit,
+            "dirty": dirty,
+            "commit_after": None,
+            "dirty_after": None,
+            "model": model_name,
+            "database_sha256_before": initial_hash,
+            "database_sha256_after": None,
+            "selected_cases": list(selected),
+            "attempted_cases": [],
+            "completed_cases": 0,
+            "error_code": None,
+            "integrity_issues": [],
+            "cases": [],
+        }
     failures = 0
     for case in selected:
+        if bundle is not None:
+            bundle["attempted_cases"].append(case)
         db = RecordingSQLite(db_path)
+        answer: Answer | None = None
+        selected_sql: str | None = None
         try:
             answer = DataAnalyst(db, model_factory(case)).ask(QUESTIONS[case - 1])
+            selected_sql = db.sql_for(answer)
             outcome = assess_case(
                 case,
                 answer,
                 references[case - 1],
-                db.sql_for(answer),
+                selected_sql,
                 history=tuple(db.successful_queries),
             )
             steps = answer.steps
             actual_rows = len(answer.data.rows) if answer.data is not None else 0
             aggregate_match = outcome.aggregate_match
-        except Exception as exc:
+            if bundle is not None:
+                bundle["completed_cases"] += 1
+        except (Exception, KeyboardInterrupt) as exc:
             # Exception messages and final prose may contain model/tool data.
             outcome = CaseAssessment("FAIL", (f"execution_{type(exc).__name__}",), False)
             steps = getattr(exc, "steps", ())
             actual_rows = 0
             aggregate_match = False
+            if bundle is not None:
+                bundle["error_code"] = outcome.issues[0]
+        if bundle is not None:
+            try:
+                bundle["cases"].append(
+                    _private_case_record(case, outcome, answer, selected_sql, db)
+                )
+            except Exception as exc:
+                print(f"PRIVATE_REVIEW_FAIL: {type(exc).__name__}", file=out)
+                return 3
         failures += outcome.status != "PASS"
         print(f"CASE {case} {outcome.status} {' '.join(outcome.issues)}", file=out)
         print(
@@ -1063,11 +1170,36 @@ def run_evaluation(
                 print(f"SQL {safe_sql_for_log(step.sql)}", file=out)
         if outcome.issues and outcome.issues[0].startswith("execution_"):
             break
+    if bundle is not None:
+        integrity_issues: list[str] = []
+        try:
+            bundle["database_sha256_after"] = private_review_store.sha256_file(db_path)
+            if bundle["database_sha256_after"] != bundle["database_sha256_before"]:
+                integrity_issues.append("database_changed")
+        except Exception:
+            integrity_issues.append("database_hash_unavailable")
+        try:
+            bundle["commit_after"], bundle["dirty_after"] = private_review_store.git_state()
+            if bundle["commit_after"] != bundle["commit"] or bundle["dirty_after"]:
+                integrity_issues.append("source_changed")
+        except Exception:
+            integrity_issues.append("source_state_unavailable")
+        bundle["integrity_issues"] = integrity_issues
+        try:
+            path = private_review_store.write_private_review(bundle)
+        except Exception as exc:
+            print(f"PRIVATE_REVIEW_FAIL: {type(exc).__name__}", file=out)
+            return 3
+        print(f"PRIVATE_REVIEW_SAVED file={path.name}", file=out)
+        if integrity_issues:
+            print(f"PRIVATE_REVIEW_FAIL: {' '.join(integrity_issues)}", file=out)
+            return 3
     return int(failures != 0)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--private-review", action="store_true")
     parser.add_argument("cases", nargs="*", type=int, choices=range(1, 6))
     args = parser.parse_args(argv)
     raw_db_path = os.getenv("DATABASE_PATH")
@@ -1083,6 +1215,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         print(f"REFERENCE_FAIL: {type(exc).__name__}")
         return 3
+    selected = tuple(args.cases) or (1, 2, 3, 4, 5)
+    if len(references) != 5:
+        print("REFERENCE_FAIL: invalid_reference_count")
+        return 3
+    if any(not references[case - 1] for case in selected):
+        print("REFERENCE_FAIL: empty_reference")
+        return 3
 
     # Deliberately imported only after preflight; tests never instantiate a provider.
     from openai import OpenAI
@@ -1095,7 +1234,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         db_path,
         references,
         lambda _case: OpenAIModel(client, model_name),
-        selected=tuple(args.cases) or (1, 2, 3, 4, 5),
+        selected=selected,
+        private_review=args.private_review,
+        model_name=model_name,
     )
 
 
