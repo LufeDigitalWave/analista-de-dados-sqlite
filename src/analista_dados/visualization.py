@@ -1,0 +1,66 @@
+"""Prepare trustworthy tables and charts from executed SQL results."""
+
+from dataclasses import dataclass
+
+import pandas as pd
+
+from analista_dados.models import ChartSpec, QueryResult
+
+
+@dataclass(frozen=True)
+class PreparedVisualization:
+    kind: str
+    frame: pd.DataFrame
+    table: pd.DataFrame
+    x_column: str | None
+    y_columns: tuple[str, ...]
+
+
+def prepare_visualization(
+    result: QueryResult, suggestion: ChartSpec, override: str = "auto"
+) -> PreparedVisualization:
+    """Use a chart only when its axes match complete, numeric query results."""
+    table = pd.DataFrame(result.rows, columns=result.columns)
+    fallback = PreparedVisualization("table", table, table, None, ())
+    kind = suggestion.kind if override == "auto" else override
+    if kind not in {"bar", "line"} or result.truncated or table.empty:
+        return fallback
+
+    x_column = suggestion.x_column
+    y_column = suggestion.y_column
+    if (
+        len(set(result.columns)) != len(result.columns)
+        or x_column not in table.columns
+        or y_column not in table.columns
+        or x_column == y_column
+        or table[x_column].isna().any()
+        or not pd.api.types.is_numeric_dtype(table[y_column])
+    ):
+        return fallback
+
+    series_column = suggestion.series_column
+    if not series_column:
+        frame = table[[x_column, y_column]].copy()
+        return PreparedVisualization(kind, frame, table, x_column, (y_column,))
+
+    if (
+        series_column not in table.columns
+        or series_column in {x_column, y_column}
+        or table[series_column].isna().any()
+        or table[[x_column, series_column]].duplicated().any()
+    ):
+        return fallback
+
+    try:
+        frame = table.pivot(index=x_column, columns=series_column, values=y_column).reset_index()
+    except (TypeError, ValueError):
+        # Labels returned by SQL can collide with the index name or be unsortable.
+        return fallback
+    names = [str(name) for name in frame.columns]
+    if len(set(names)) != len(names):
+        return fallback
+    frame.columns = names
+    y_columns = tuple(name for name in names if name != x_column)
+    if not y_columns:
+        return fallback
+    return PreparedVisualization(kind, frame, table, x_column, y_columns)
