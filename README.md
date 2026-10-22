@@ -58,7 +58,7 @@ Perguntas verificadas contra o banco fornecido, com definições em [evals/refer
 | Reclamações não resolvidas por canal | Telefone 19; Chat 18; E-mail 14 |
 | Reclamações por canal no ano anterior à última data disponível | 97 no total; série mensal por canal |
 
-Esses números são oráculos de verificação, não respostas embutidas no produto. Uma resposta SQL sintaticamente válida ainda pode interpretar mal uma pergunta; confira período, denominador, tabela e filtros na trilha antes de tomar uma decisão.
+Esses números são oráculos de verificação, não respostas embutidas no produto. Uma resposta SQL sintaticamente válida ainda pode interpretar mal uma pergunta; confira período, denominador, tabela e filtros na trilha antes de tomar uma decisão. O protótipo também não comprova automaticamente que cada afirmação do texto gerado coincide com os valores da tabela exibida.
 
 Para reproduzir com o arquivo recebido, abra `python -m sqlite3 "$env:DATABASE_PATH"` no PowerShell (ou `python -m sqlite3 "$DATABASE_PATH"` no Bash) e rode os cinco blocos de `evals/reference_queries.sql` em qualquer cliente SQLite. O banco não está no Git; sem ele, um clone não consegue validar os valores numéricos.
 

@@ -180,6 +180,9 @@ def test_denies_personal_column_variants_without_blocking_campaign_name(tmp_path
         "cpf_cliente",
         "email_pessoal",
         "nome_completo",
+        "CPFCliente",
+        "EMAILCliente",
+        "NOMECliente",
     )
     with sqlite3.connect(path) as connection:
         definitions = ", ".join(f'"{column}" TEXT' for column in personal_columns)

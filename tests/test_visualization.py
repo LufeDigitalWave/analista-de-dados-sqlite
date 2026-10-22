@@ -150,6 +150,36 @@ def test_manual_line_override_infers_unique_channel_series_for_temporal_trend():
     assert view.frame.set_index("mes").loc["2025-02", "E-mail"] == 4
 
 
+def test_manual_line_override_infers_series_with_explicit_temporal_axes():
+    result = _result(
+        ("mes", "canal", "total"),
+        (
+            ("2025-01", "Chat", 2),
+            ("2025-01", "E-mail", 1),
+            ("2025-02", "Chat", 3),
+            ("2025-02", "E-mail", 4),
+        ),
+    )
+    suggestion = ChartSpec("table", "mes", "total", "")
+
+    view = prepare_visualization(result, suggestion, override="line")
+
+    assert view.kind == "line"
+    assert view.x_column == "mes"
+    assert set(view.y_columns) == {"Chat", "E-mail"}
+    assert view.frame.set_index("mes").loc["2025-02", "E-mail"] == 4
+
+
+def test_line_without_series_rejects_duplicate_x_values():
+    result = _result(("mes", "total"), (("2025-01", 2), ("2025-01", 3)))
+
+    manual = prepare_visualization(result, ChartSpec("table", "mes", "total", ""), "line")
+    automatic = prepare_visualization(result, ChartSpec("line", "mes", "total", ""))
+
+    assert manual.kind == "table"
+    assert automatic.kind == "table"
+
+
 def test_manual_line_override_rejects_ambiguous_series_candidates():
     result = _result(
         ("canal", "regiao", "mes", "total"),

@@ -20,8 +20,8 @@ MAX_RESULT_BYTES = 128 * 1024
 
 
 def _is_protected_column(column: str) -> bool:
-    # Split both snake_case and camelCase, then fold accents for common PT-BR names.
-    separated = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", column)
+    # Split camelCase and acronym boundaries, then fold accents for common PT-BR names.
+    separated = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", column)
     folded = "".join(
         character
         for character in unicodedata.normalize("NFKD", separated.casefold())

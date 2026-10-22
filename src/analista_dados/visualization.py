@@ -85,7 +85,7 @@ def prepare_visualization(
     ):
         return fallback
 
-    if override == "line" and not suggestion.x_column and _is_temporal_column(x_column):
+    if override == "line" and _is_temporal_column(x_column):
         if not series_column:
             candidates = [
                 column
@@ -97,10 +97,10 @@ def prepare_visualization(
                 return fallback
             if candidates:
                 series_column = candidates[0]
-            elif table[x_column].duplicated().any():
-                return fallback
 
     if not series_column:
+        if kind == "line" and table[x_column].duplicated().any():
+            return fallback
         frame = table[[x_column, y_column]].copy()
         return PreparedVisualization(kind, frame, table, x_column, (y_column,))
 
