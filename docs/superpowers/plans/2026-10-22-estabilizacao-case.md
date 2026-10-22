@@ -17,7 +17,7 @@
 | 0. Escolha e desenho | Concluída | Ler o enunciado, escolher o Desafio 1, fixar interfaces, riscos e limites de publicação | `using-superpowers`, `task-observer`, `pdf`, `brainstorming`, `escopo-fechado`, `codebase-design` |
 | 1. Base do produto | Concluída | Executor SQLite, adaptador OpenAI, agente, visualização, Streamlit, cinco oráculos e README; detalhes no [plano inicial](2026-10-22-assistente-dados.md) | `test-driven-development`, `task-impl`, `prompt-engineering-patterns`, `openai-docs`, `verification-before-completion` |
 | 2. Estabilização | Concluída | Contratos E1/D1/S1/U1 e regressões das Tasks 1–4B deste plano | `systematic-debugging`, `receiving-code-review`, `test-driven-development`, `task-impl`, `security-best-practices`, `impeccable`, `webapp-testing`, `playwright-cli` |
-| 3. Fechamento | Em andamento | Task 5: testes, avaliação real, revisão de segurança, commit, atualização do GitHub e ZIP | `code-reviewer`, `secret-scanning`, `verification-before-completion`, `finishing-a-development-branch` |
+| 3. Fechamento | Concluída | Task 5: testes, avaliação real, revisão de segurança, commit, atualização do GitHub e ZIP | `code-reviewer`, `secret-scanning`, `verification-before-completion`, `finishing-a-development-branch` |
 
 O usuário dispensou Strix especificamente neste case; nenhuma fase depende dele. Para a API, a documentação oficial OpenAI é a fonte autoritativa; Context7 não estava disponível neste host. Nenhuma tarefa restante pede OCR, infraestrutura ou publicação do banco.
 
