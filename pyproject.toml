@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "analista-dados-sqlite"
+version = "0.1.0"
+description = "Assistente local de análise de dados sobre SQLite"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=3,<4",
+    "pandas>=3,<4",
+    "streamlit>=1.40,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.13,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+analista_dados = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
