@@ -61,6 +61,13 @@ def test_one_function_call_is_translated_and_api_is_private_by_default():
         assert set(tool["parameters"]["required"]) == set(tool["parameters"]["properties"])
 
 
+def test_prompt_guides_boolean_truth_and_final_result_shape():
+    instructions = OpenAIModel(FakeClient(model_response(function_call()))).instructions
+
+    assert "1 significa verdadeiro" in instructions
+    assert "métrica e as dimensões pedidas" in instructions
+
+
 def test_sql_arguments_are_decoded_without_mutating_input_history():
     history = [{"role": "user", "content": "Conte eventos"}]
     item = function_call(

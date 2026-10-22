@@ -1,5 +1,7 @@
 # Assistente de Dados SQLite Implementation Plan
 
+> Registro histórico da construção inicial. Para as correções e gates da entrega atual, siga o [plano de estabilização](2026-10-22-estabilizacao-case.md), que substitui as tarefas ainda abertas abaixo. O gate antigo de Strix não integra esta rodada, por decisão expressa do usuário.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Entregar o Desafio Técnico 1 como aplicação local que responde perguntas sobre SQLite com SQL dinâmico, gráfico/tabela e rastreio das consultas.

@@ -56,14 +56,14 @@ def render_steps(steps: tuple[TraceStep, ...]) -> None:
 
 
 def render_answer(answer: Answer) -> None:
-    st.markdown("### Resposta")
+    st.markdown("## Resposta")
     st.text(answer.text)
     if answer.assumptions:
         st.info("Interpretação usada")
         st.text(answer.assumptions)
 
     if answer.data is not None:
-        st.markdown("### Dados consultados")
+        st.markdown("## Dados consultados")
         choices = {
             "Automático": "auto",
             "Tabela": "table",
@@ -78,9 +78,36 @@ def render_answer(answer: Answer) -> None:
         )
         view = prepare_visualization(answer.data, answer.chart, choices[selected])
         if view.kind == "bar":
-            st.bar_chart(view.frame, x=view.x_column, y=list(view.y_columns), width="stretch")
+            st.bar_chart(
+                view.frame,
+                x=view.x_column,
+                y=list(view.y_columns),
+                horizontal=True,
+                height=max(300, min(720, 36 * len(view.frame))),
+                width="stretch",
+                alt=(
+                    f"Gráfico de barras horizontais de {', '.join(view.y_columns)} "
+                    f"por {view.x_column}; valores completos na tabela abaixo."
+                ),
+            )
         elif view.kind == "line":
-            st.line_chart(view.frame, x=view.x_column, y=list(view.y_columns), width="stretch")
+            monthly_axis = view.frame[view.x_column].dtype.kind == "M"
+            x_label = "Mês (ano)" if monthly_axis else view.x_column
+            st.line_chart(
+                view.frame,
+                x=view.x_column,
+                y=list(view.y_columns),
+                x_label=x_label,
+                width="stretch",
+                alt=(
+                    f"Gráfico de linhas de {', '.join(view.y_columns)} "
+                    f"por {view.x_column}; valores completos na tabela abaixo."
+                ),
+            )
+            if monthly_axis:
+                first = view.frame[view.x_column].min()
+                last = view.frame[view.x_column].max()
+                st.caption(f"Período no gráfico: {first:%m/%Y} a {last:%m/%Y}.")
         elif selected in {"Barras", "Linha"}:
             st.caption(
                 "Este resultado não tem colunas apropriadas para esse gráfico; veja a tabela."
@@ -97,7 +124,7 @@ def main() -> None:
     st.set_page_config(
         page_title="Assistente de dados SQLite",
         layout="centered",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="auto",
     )
     path = database_path()
     has_database = path.is_file()
@@ -105,7 +132,7 @@ def main() -> None:
     model_name = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
     with st.sidebar:
-        st.markdown("### Configuração")
+        st.markdown("## Configuração")
         st.write(f"Banco: {'pronto' if has_database else 'não encontrado'}")
         st.write(f"Chave da API: {'configurada' if has_key else 'ausente'}")
         st.caption(f"Modelo: {model_name}")
@@ -123,7 +150,7 @@ def main() -> None:
 
     example_question = None
     if "answer" not in st.session_state and "error" not in st.session_state:
-        st.markdown("### Experimente perguntar")
+        st.markdown("## Experimente perguntar")
         for index, example in enumerate(EXAMPLES):
             if st.button(example, key=f"example-{index}", disabled=not ready, width="stretch"):
                 example_question = example
@@ -147,7 +174,7 @@ def main() -> None:
                 status.update(label="Análise concluída", state="complete")
 
     if "question" in st.session_state:
-        st.markdown("### Pergunta")
+        st.markdown("## Pergunta")
         st.text(st.session_state.question)
     if "answer" in st.session_state:
         render_answer(st.session_state.answer)

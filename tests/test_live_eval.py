@@ -8,6 +8,7 @@ import sqlite3
 import pytest
 
 from analista_dados.models import Answer, ChartSpec, ModelTurn, QueryResult, ToolCall
+from analista_dados.visualization import prepare_visualization
 from evals.live_eval import (
     QUESTIONS,
     RecordingSQLite,
@@ -128,6 +129,15 @@ def test_q1_missing_may_filter_cannot_pass_on_coincidental_aggregate() -> None:
     )
     outcome = assess_case(1, _answer(1), REFERENCES[0], wrong_sql)
     assert outcome.status != "PASS"
+    assert "q1_sql_review" in outcome.issues
+
+
+@pytest.mark.parametrize("operator", ("<>", "!="))
+def test_q1_negated_app_channel_cannot_pass_on_coincidental_aggregate(operator: str) -> None:
+    wrong_sql = SQL[0].replace("p.canal = 'App'", f"p.canal {operator} 'App'")
+    outcome = assess_case(1, _answer(1), REFERENCES[0], wrong_sql)
+
+    assert outcome.status == "REVIEW"
     assert "q1_sql_review" in outcome.issues
 
 
@@ -316,6 +326,16 @@ def test_q5_equivalent_date_wrapper_on_upper_bound_passes() -> None:
     assert outcome.status == "PASS", outcome.issues
 
 
+def test_q5_datetime_chart_axis_matches_reference_months() -> None:
+    answer = _answer(5)
+    assert answer.data is not None
+    chart = prepare_visualization(answer.data, answer.chart)
+    assert list(chart.frame["mes"].dt.strftime("%Y-%m")) == ["2024-07", "2024-08"]
+
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+    assert outcome.status == "PASS", outcome.issues
+
+
 def test_q5_relative_lower_and_upper_bounds_projected_from_one_cte_pass() -> None:
     equivalent = (
         "WITH limites AS (SELECT MAX(date(data_contato)) AS fim, "
@@ -374,6 +394,154 @@ def test_q5_explicit_wrong_total_still_fails() -> None:
     assert "answer_text_mismatch" in outcome.issues
 
 
+def test_q5_correct_local_counts_are_not_mistaken_for_global_total() -> None:
+    answer = _answer(5, text="Foram 5 reclamações no Chat; 7 por E-mail e 9 por Telefone.")
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+
+    assert outcome.status == "PASS", outcome.issues
+
+
+def test_q5_full_period_channel_count_still_passes() -> None:
+    answer = _answer(5, text="No último ano, Chat teve 5 reclamações.")
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+
+    assert outcome.status == "PASS", outcome.issues
+
+
+def test_q5_explicit_full_twelve_months_still_passes() -> None:
+    answer = _answer(5, text="Nos últimos 12 meses, Chat teve 5 reclamações.")
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+
+    assert outcome.status == "PASS", outcome.issues
+
+
+def test_q5_wrong_channel_counts_fail_even_when_series_matches() -> None:
+    answer = _answer(
+        5,
+        text="Telefone teve 999 reclamações; Chat teve 7 e E-mail teve 9.",
+    )
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+
+    assert outcome.status == "FAIL"
+    assert "answer_text_mismatch" in outcome.issues
+
+
+def test_q5_number_shared_between_channels_needs_review() -> None:
+    answer = _answer(5, text="Chat e E-mail tiveram 5 reclamações; Telefone está na tabela.")
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+
+    assert outcome.status == "REVIEW"
+    assert "answer_text_review" in outcome.issues
+
+
+def test_q5_coordinated_channel_sum_is_not_a_single_channel_count() -> None:
+    reference = (("2024-07", "Chat", 5), ("2024-07", "E-mail", 7))
+    answer = Answer(
+        "Foram 12 reclamações no Chat e E-mail.",
+        "",
+        QueryResult(COLUMNS[4], reference),
+        ChartSpec("line", "mes", "reclamacoes", "canal"),
+        (),
+    )
+    outcome = assess_case(5, answer, reference, SQL[4])
+
+    assert outcome.status == "REVIEW", outcome.issues
+    assert "answer_text_review" in outcome.issues
+    assert "answer_text_mismatch" not in outcome.issues
+
+
+def test_q5_wrong_count_for_one_explicit_channel_still_fails() -> None:
+    answer = _answer(5, text="Foram 99 reclamações no Chat.")
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+
+    assert outcome.status == "FAIL", outcome.issues
+    assert "answer_text_mismatch" in outcome.issues
+
+
+def test_q5_local_total_with_unparsed_wording_needs_review() -> None:
+    answer = _answer(5, text="Chat: total de 5 reclamações. Os demais estão na tabela.")
+    outcome = assess_case(5, answer, REFERENCES[4], SQL[4])
+
+    assert outcome.status == "REVIEW"
+    assert "answer_text_review" in outcome.issues
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Foram 999,5 reclamações no período.",
+        "Chat: 5,9 reclamações; E-mail: 7; Telefone: 9.",
+        "Chat: 5.9 reclamações; E-mail: 7; Telefone: 9.",
+        "Foram 5,9 reclamações no Chat.",
+    ),
+)
+def test_q5_fractional_count_requires_review_without_matching_integer_prefix(text: str) -> None:
+    outcome = assess_case(5, _answer(5, text=text), REFERENCES[4], SQL[4])
+
+    assert outcome.status == "REVIEW", outcome.issues
+    assert "answer_text_review" in outcome.issues
+    assert "answer_text_mismatch" not in outcome.issues
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Chat teve cinco reclamações.",
+        "Foram vinte e uma reclamações no período.",
+        "Chat: 5 mil reclamações.",
+        "Chat: 5% das reclamações.",
+    ),
+)
+def test_q5_unparsed_quantities_require_review(text: str) -> None:
+    outcome = assess_case(5, _answer(5, text=text), REFERENCES[4], SQL[4])
+
+    assert outcome.status == "REVIEW", outcome.issues
+    assert "answer_text_review" in outcome.issues
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Em julho de 2024, Chat teve 1 reclamação.",
+        "Em 2024, Chat teve 1 reclamação.",
+        "Em julho de 2024, houve 1 reclamação.",
+    ),
+)
+def test_q5_time_scoped_count_is_not_compared_with_full_period(text: str) -> None:
+    outcome = assess_case(5, _answer(5, text=text), REFERENCES[4], SQL[4])
+
+    assert outcome.status == "REVIEW", outcome.issues
+    assert "answer_text_review" in outcome.issues
+    assert "answer_text_mismatch" not in outcome.issues
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "No primeiro trimestre, Chat teve 1 reclamação.",
+        "No primeiro semestre, Chat teve 1 reclamação.",
+        "Na primeira semana, Chat teve 5 reclamações.",
+        "No primeiro dia, Chat teve 5 reclamações.",
+        "No mês, Chat teve 1 reclamação.",
+        "Nos 2 meses, Chat teve 1 reclamação.",
+    ),
+)
+def test_q5_subannual_count_requires_review_with_synthetic_series(text: str) -> None:
+    reference = (("2024-01", "Chat", 1), ("2024-07", "Chat", 4))
+    answer = Answer(
+        text,
+        "",
+        QueryResult(COLUMNS[4], reference),
+        ChartSpec("line", "mes", "reclamacoes", "canal"),
+        (),
+    )
+    outcome = assess_case(5, answer, reference, SQL[4])
+
+    assert outcome.status == "REVIEW", outcome.issues
+    assert "answer_text_review" in outcome.issues
+    assert "answer_text_mismatch" not in outcome.issues
+
+
 def test_q5_unrecognized_relative_period_requires_review_not_false_failure() -> None:
     alternative = SQL[4].replace("'-1 year'", "'-365 days'")
     outcome = assess_case(5, _answer(5), REFERENCES[4], alternative)
@@ -410,6 +578,96 @@ def test_or_predicate_never_passes_automatic_semantic_gate(case: int) -> None:
     outcome = assess_case(case, _answer(case), REFERENCES[case - 1], wrong_sql)
     assert outcome.status == "REVIEW"
     assert "or_predicate_review" in outcome.issues
+
+
+@pytest.mark.parametrize(
+    ("case", "negated_sql"),
+    (
+        (1, SQL[0].replace("p.canal = 'App'", "NOT (p.canal = 'App')")),
+        (2, SQL[1].replace("interagiu = 1", "NOT (interagiu = 1)")),
+        (4, SQL[3].replace("resolvido = 0", "NOT (resolvido = 0)")),
+    ),
+)
+def test_negated_sql_predicate_requires_review_when_aggregate_coincides(
+    case: int, negated_sql: str
+) -> None:
+    outcome = assess_case(case, _answer(case), REFERENCES[case - 1], negated_sql)
+
+    assert outcome.status == "REVIEW", outcome.issues
+    assert "negated_predicate_review" in outcome.issues
+    assert outcome.aggregate_match
+
+
+def test_negated_sql_predicate_does_not_hide_aggregate_mismatch() -> None:
+    negated_sql = SQL[1].replace("interagiu = 1", "NOT (interagiu = 1)")
+    outcome = assess_case(2, _answer(2, rows=((18,),)), REFERENCES[1], negated_sql)
+
+    assert outcome.status == "FAIL", outcome.issues
+    assert "aggregate_mismatch" in outcome.issues
+    assert "negated_predicate_review" in outcome.issues
+
+
+def test_q4_null_as_unresolved_fails_even_when_aggregates_coincide() -> None:
+    wrong_sql = SQL[3].replace("resolvido = 0", "(resolvido = 0 OR resolvido IS NULL)")
+    outcome = assess_case(4, _answer(4), REFERENCES[3], wrong_sql)
+
+    assert outcome.status == "FAIL"
+    assert "q4_null_expansion" in outcome.issues
+
+
+def test_q4_negated_null_predicate_needs_review_not_false_failure() -> None:
+    equivalent_sql = SQL[3].replace("resolvido = 0", "NOT (resolvido IS NULL OR resolvido = 1)")
+    outcome = assess_case(4, _answer(4), REFERENCES[3], equivalent_sql)
+
+    assert outcome.status == "REVIEW"
+    assert "or_predicate_review" in outcome.issues
+    assert "q4_null_expansion" not in outcome.issues
+
+
+def test_q4_explicit_non_null_guard_needs_review_not_false_failure() -> None:
+    equivalent_sql = SQL[3].replace(
+        "resolvido = 0",
+        "(resolvido = 0 OR resolvido IS NULL) AND resolvido IS NOT NULL",
+    )
+    outcome = assess_case(4, _answer(4), REFERENCES[3], equivalent_sql)
+
+    assert outcome.status == "REVIEW"
+    assert "or_predicate_review" in outcome.issues
+    assert "q4_null_expansion" not in outcome.issues
+
+
+def test_q4_count_nonnull_column_needs_review_not_false_failure() -> None:
+    alternative_sql = (
+        SQL[3]
+        .replace("COUNT(*)", "COUNT(resolvido)")
+        .replace("resolvido = 0", "(resolvido = 0 OR resolvido IS NULL)")
+    )
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute(
+            "CREATE TABLE suporte (canal TEXT, tipo_contato TEXT, resolvido INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO suporte VALUES (?, ?, ?)",
+            [
+                ("Chat", "Reclamação", 0),
+                ("Chat", "Reclamação", 1),
+                ("Chat", "Reclamação", None),
+            ],
+        )
+        assert (
+            connection.execute(alternative_sql).fetchall() == connection.execute(SQL[3]).fetchall()
+        )
+
+    outcome = assess_case(4, _answer(4), REFERENCES[3], alternative_sql)
+    assert outcome.status == "REVIEW"
+    assert "q4_null_expansion" not in outcome.issues
+
+
+def test_q4_explicitly_excluding_null_remains_equivalent() -> None:
+    equivalent_sql = SQL[3].replace("GROUP BY canal", "AND resolvido IS NOT NULL GROUP BY canal")
+    outcome = assess_case(4, _answer(4), REFERENCES[3], equivalent_sql)
+
+    assert outcome.status == "PASS", outcome.issues
 
 
 def test_q5_literal_date_cutoff_needs_review_without_probe_history() -> None:

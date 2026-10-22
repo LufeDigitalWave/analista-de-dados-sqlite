@@ -48,6 +48,22 @@ _COUNT_DISTINCT_CLIENT = re.compile(
     r"\bCOUNT\s*\(\s*DISTINCT\s+(?:[A-Za-z_]\w*\.)?cliente_id\s*\)", re.IGNORECASE
 )
 _LABEL_NUMBER = re.compile(r"(?<!\w)[+-]?\d+(?:[,.]\d+)?")
+_Q5_FRACTION = re.compile(r"(?<!\w)\d+[,.]\d+(?!\w)")
+_Q5_UNPARSED_QUANTITY = re.compile(
+    r"\b(?:zero|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez|onze|"
+    r"doze|treze|catorze|quatorze|quinze|dezesseis|dezessete|dezoito|"
+    r"dezenove|vinte|trinta|quarenta|cinquenta|sessenta|setenta|oitenta|"
+    r"noventa|cem|cento|duzent[oa]s?|trezent[oa]s?|quatrocent[oa]s?|"
+    r"quinhent[oa]s?|seiscent[oa]s?|setecent[oa]s?|oitocent[oa]s?|"
+    r"novecent[oa]s?|mil|milhao|milhoes|bilhao|bilhoes|metade|dobro|triplo)\b"
+    r"|\b(?:um|uma)\s+reclam\w*\b|(?<!\w)\d+\s*%"
+)
+_Q5_FULL_PERIOD = re.compile(r"\b(?:no ultimo ano|nos ultimos 12 meses|no periodo)\b")
+_Q5_NARROW_PERIOD = re.compile(
+    r"\b(?:janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|"
+    r"outubro|novembro|dezembro|mes(?:es)?|trimestres?|semestres?|"
+    r"semanas?|dias?|(?:19|20)\d{2}(?:[-/]\d{2}(?:[-/]\d{2})?)?)\b"
+)
 _SQL_COMMENTS = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 
 
@@ -216,6 +232,100 @@ def _text_integer_verdict(text: str, expected: int, *, exclude_years: bool) -> s
     return "wrong" if numbers else "missing"
 
 
+def _q5_claim_has_narrow_period(text: str, start: int, end: int) -> bool:
+    clause_start = max(text.rfind(delimiter, 0, start) for delimiter in (";", ".", "\n")) + 1
+    clause_end = min(
+        [position for delimiter in (";", ".", "\n") if (position := text.find(delimiter, end)) >= 0]
+        or [len(text)]
+    )
+    clause = _Q5_FULL_PERIOD.sub(" ", text[clause_start:clause_end])
+    return _Q5_NARROW_PERIOD.search(clause) is not None
+
+
+def _q5_text_verdict(text: str, expected: Sequence[tuple]) -> str:
+    """Check explicit channel counts without treating local counts as a global total."""
+    folded = _fold(text)
+    if "reclam" not in folded:
+        return "review"
+    by_channel: dict[str, int] = {}
+    for _, channel, count in expected:
+        label = _fold(channel)
+        by_channel[label] = by_channel.get(label, 0) + int(count)
+    if not by_channel:
+        return "review"
+
+    labels = "|".join(re.escape(label) for label in sorted(by_channel, key=len, reverse=True))
+    label_match = rf"(?<!\w)(?P<label>{labels})(?!\w)"
+    patterns = (
+        rf"{label_match}\s*(?::|=|teve|tem|registrou|somou|apresentou|foram)\s*"
+        r"(?P<count>\d+)\b(?![,.]\d)",
+        rf"(?<![\d,.])(?P<count>\d+)\b(?![,.]\d)\s+"
+        rf"(?:reclam\w*\s+)?(?:no|na|em|por|para)\s+"
+        rf"(?:canal\s+)?{label_match}",
+    )
+    claimed_spans: set[tuple[int, int]] = set()
+    claimed_channels: set[str] = set()
+    wrong = False
+    ambiguous = bool(_Q5_FRACTION.search(folded) or _Q5_UNPARSED_QUANTITY.search(folded))
+    for pattern_index, pattern in enumerate(patterns):
+        for match in re.finditer(pattern, folded):
+            claimed_spans.add(match.span("count"))
+            label = match.group("label")
+            claimed_channels.add(label)
+            if pattern_index == 1 and re.match(
+                rf"\s*(?:\be\b|,|/)\s+(?:(?:no|na|em)\s+)?(?:canal\s+)?(?:{labels})(?!\w)",
+                folded[match.end() :],
+            ):
+                ambiguous = True
+                continue
+            if _q5_claim_has_narrow_period(folded, match.start(), match.end()):
+                ambiguous = True
+                continue
+            wrong |= int(match.group("count")) != by_channel[label]
+
+    total = sum(by_channel.values())
+    for match in re.finditer(
+        r"\b(?:foram|houve|total(?:\s+de|\s*:)?)\s+(?P<count>\d+)\s+reclam\w*",
+        folded,
+    ):
+        span = match.span("count")
+        if span in claimed_spans:
+            continue
+        if _q5_claim_has_narrow_period(folded, match.start(), match.end()):
+            ambiguous = True
+            continue
+        preceding = folded[
+            max(folded.rfind(delimiter, 0, match.start()) for delimiter in (";", ".", "\n"))
+            + 1 : match.start()
+        ]
+        if re.search(rf"(?<!\w)(?:{labels})(?!\w)", preceding):
+            ambiguous = True
+            continue
+        following = folded[match.end() :]
+        location = re.match(r"\s+(?:no|na|em|por|para)\s+(?:canal\s+)?([\w-]+)", following)
+        if location and location.group(1) not in {"periodo", "total", "ano", "mes", "ultimo"}:
+            ambiguous = True
+            continue
+        claimed_spans.add(span)
+        wrong |= int(match.group("count")) != total
+
+    for match in re.finditer(r"(?<![\d,.])\d+(?![\d,.])", folded):
+        if match.span() in claimed_spans:
+            continue
+        number = int(match.group())
+        if 1900 <= number <= 2100 and len(match.group()) == 4:
+            continue
+        if re.match(r"\s+(?:mes(?:es)?|anos?|dias?|semanas?)\b", folded[match.end() :]):
+            continue
+        ambiguous = True
+    if claimed_channels:
+        mentioned_channels = {
+            label for label in by_channel if re.search(rf"(?<!\w){re.escape(label)}(?!\w)", folded)
+        }
+        ambiguous |= bool(mentioned_channels - claimed_channels)
+    return "wrong" if wrong else "review" if ambiguous else "ok"
+
+
 def _text_checks(
     case: int, answer: Answer, expected: Sequence[tuple], failures: list[str], reviews: list[str]
 ) -> None:
@@ -275,14 +385,10 @@ def _text_checks(
             elif verdict != "ok":
                 reviews.append("answer_text_review")
     else:
-        total = sum(int(row[2]) for row in expected)
-        total_claims = re.findall(
-            r"\b(?:foram|houve|total(?:\s+de|\s*:)?)\s+(\d+)\s+reclam",
-            _fold(text),
-        )
-        if any(int(claim) != total for claim in total_claims):
+        verdict = _q5_text_verdict(text, expected)
+        if verdict == "wrong":
             failures.append("answer_text_mismatch")
-        elif "reclam" not in _fold(text):
+        elif verdict == "review":
             reviews.append("answer_text_review")
 
 
@@ -382,6 +488,13 @@ def _q1_sql_has_may_2025_filter(sql: str) -> bool:
         re.IGNORECASE,
     )
     return bool((lower and upper) or between or whole_month or (year and month))
+
+
+def _q1_sql_has_app_filter(sql: str) -> bool:
+    """Require a positive channel equality, not a bare App literal."""
+    return (
+        re.search(r"\bcanal\s*=\s*'App'(?!\w)", _without_comments(sql), re.IGNORECASE) is not None
+    )
 
 
 def _q2_sql_has_filters(sql: str) -> bool:
@@ -566,6 +679,127 @@ def _q5_literal_period_from_probe_verdict(
     return "unknown"
 
 
+def _without_parens(node: exp.Expression) -> exp.Expression:
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
+
+
+def _q4_eq(node: exp.Expression, column: str, literal: str) -> bool:
+    node = _without_parens(node)
+    if not isinstance(node, exp.EQ):
+        return False
+    for field, value in ((node.this, node.expression), (node.expression, node.this)):
+        if (
+            isinstance(field, exp.Column)
+            and field.name.casefold() == column
+            and isinstance(value, exp.Literal)
+            and str(value.this).casefold() == literal.casefold()
+            and value.is_string == (literal != "0")
+        ):
+            return True
+    return False
+
+
+def _q4_resolved_is_null(node: exp.Expression) -> bool:
+    return (
+        isinstance(node, exp.Is)
+        and isinstance(node.this, exp.Column)
+        and node.this.name.casefold() == "resolvido"
+        and isinstance(node.expression, exp.Null)
+    )
+
+
+def _q4_null_is_positive(node: exp.Expression) -> bool:
+    negated = False
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Not):
+            negated = not negated
+        parent = parent.parent
+    return not negated
+
+
+def _q4_and_terms(node: exp.Expression) -> list[exp.Expression]:
+    node = _without_parens(node)
+    if isinstance(node, exp.And):
+        return _q4_and_terms(node.this) + _q4_and_terms(node.expression)
+    return [node]
+
+
+def _q4_redundant_not_null_guard(tree: exp.Expression, node: exp.Not) -> bool:
+    if not isinstance(tree, exp.Select) or not _q4_resolved_is_null(_without_parens(node.this)):
+        return False
+    where = tree.args.get("where")
+    if not isinstance(where, exp.Where):
+        return False
+    terms = _q4_and_terms(where.this)
+    return any(term is node for term in terms) and any(
+        _q4_eq(term, "resolvido", "0") for term in terms
+    )
+
+
+def _q4_null_expansion_verdict(tree: exp.Expression) -> str:
+    """Fail only the simple proven NULL-inclusive filter; review other positive tests."""
+    positive_tests = [
+        node
+        for node in tree.find_all(exp.Is)
+        if _q4_resolved_is_null(node) and _q4_null_is_positive(node)
+    ]
+    if not positive_tests:
+        return "none"
+    if (
+        len(positive_tests) != 1
+        or not isinstance(tree, exp.Select)
+        or any(tree.find(kind) is not None for kind in (exp.Join, exp.With, exp.Subquery))
+        or len(list(tree.find_all(exp.Select))) != 1
+        or {table.name.casefold() for table in tree.find_all(exp.Table)} != {"suporte"}
+    ):
+        return "review"
+    projected = [
+        _without_parens(item.this if isinstance(item, exp.Alias) else item)
+        for item in tree.expressions
+    ]
+    group = tree.args.get("group")
+    if (
+        len(projected) != 2
+        or not any(
+            isinstance(item, exp.Column) and item.name.casefold() == "canal" for item in projected
+        )
+        or not any(
+            isinstance(item, exp.Count)
+            and isinstance(item.this, exp.Star)
+            and not item.args.get("distinct")
+            for item in projected
+        )
+        or not isinstance(group, exp.Group)
+        or len(group.expressions) != 1
+        or not isinstance(_without_parens(group.expressions[0]), exp.Column)
+        or _without_parens(group.expressions[0]).name.casefold() != "canal"
+        or any(tree.args.get(key) is not None for key in ("having", "qualify", "limit", "distinct"))
+    ):
+        return "review"
+    where = tree.args.get("where")
+    if not isinstance(where, exp.Where):
+        return "review"
+    terms = _q4_and_terms(where.this)
+    if len(terms) != 2:
+        return "review"
+    type_filters = [term for term in terms if _q4_eq(term, "tipo_contato", "Reclamação")]
+    if len(type_filters) != 1:
+        return "review"
+    null_filter = next(term for term in terms if term is not type_filters[0])
+    null_filter = _without_parens(null_filter)
+    if not isinstance(null_filter, exp.Or):
+        return "review"
+    left, right = _without_parens(null_filter.this), _without_parens(null_filter.expression)
+    if (_q4_eq(left, "resolvido", "0") and right is positive_tests[0]) or (
+        _q4_eq(right, "resolvido", "0") and left is positive_tests[0]
+    ):
+        return "wrong"
+    return "review"
+
+
 def assess_case(
     case: int,
     answer: Answer,
@@ -690,15 +924,21 @@ def assess_case(
                     aggregate_match = True
                     try:
                         view = prepare_visualization(data, answer.chart, "auto")
+                        chart_months = (
+                            {
+                                month if isinstance(month, str) else month.strftime("%Y-%m")
+                                for month in view.frame[view.x_column]
+                            }
+                            if view.x_column is not None
+                            else set()
+                        )
                     except Exception:
                         reviews.append("q5_chart_review")
                     else:
                         if (
                             view.kind != "line"
                             or set(view.y_columns) != {channel for _, channel in expected_series}
-                            or view.x_column is None
-                            or set(view.frame[view.x_column])
-                            != {month for month, _ in expected_series}
+                            or chart_months != {month for month, _ in expected_series}
                         ):
                             reviews.append("q5_chart_review")
                 else:
@@ -714,6 +954,17 @@ def assess_case(
         else:
             if tree.find(exp.Or) is not None:
                 reviews.append("or_predicate_review")
+            if any(
+                case != 4 or not _q4_redundant_not_null_guard(tree, node)
+                for node in tree.find_all(exp.Not)
+            ):
+                reviews.append("negated_predicate_review")
+            if case == 4:
+                null_verdict = _q4_null_expansion_verdict(tree)
+                if null_verdict == "wrong":
+                    failures.append("q4_null_expansion")
+                elif null_verdict == "review":
+                    reviews.append("q4_null_semantics_review")
             if case == 5 and _q5_anchor_has_unreviewed_filter(tree):
                 reviews.append("q5_anchor_review")
         if case == 2:
@@ -738,7 +989,7 @@ def assess_case(
                 _COUNT_DISTINCT_CLIENT.search(_without_comments(selected_sql))
                 or _has_joined_customer_pk_count(selected_sql, "compras")
             )
-            or "'App'" not in selected_sql
+            or not _q1_sql_has_app_filter(selected_sql)
             or not _q1_sql_has_may_2025_filter(selected_sql)
         ):
             reviews.append("q1_sql_review")

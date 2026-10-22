@@ -22,7 +22,7 @@ _EVENT_DATES = frozenset(
         "data_atendimento",
     }
 )
-_FLAGS = frozenset({"interagiu", "resolvido"})
+FLAG_NAMES = frozenset({"interagiu", "resolvido"})
 _MEASURES = frozenset(
     {
         "valor",
@@ -86,9 +86,10 @@ class _Scope:
 def validate_sql(sql: str, schema: dict) -> None:
     """Validate one SELECT/WITH; raise SQLPolicyError without modifying *sql*.
 
-    Only named, schema-approved categorical dimensions, event calendar buckets
-    and aggregates may be returned. Unknown columns and SQL constructs fail
-    closed. This is not k-anonymity: small groups can still be identifying.
+    Only named, schema-approved categorical dimensions, snapshot-approved binary
+    flags, event calendar buckets and aggregates may be returned. Unknown columns
+    and SQL constructs fail closed. This is not k-anonymity: small groups can
+    still be identifying.
     Event-date extrema require date() normalization so malformed text is NULL.
     """
     if not isinstance(sql, str) or not sql.strip():
@@ -116,6 +117,14 @@ def _catalog(schema: dict) -> dict[str, dict[str, _Field]]:
         category_values = table.get("categorical_values", {})
         if not isinstance(category_values, dict):
             raise SQLPolicyError("Schema inválido para validar categorias.")
+        raw_safe_flags = table.get("safe_flag_columns", [])
+        if not isinstance(raw_safe_flags, list) or not all(
+            isinstance(name, str) for name in raw_safe_flags
+        ):
+            raise SQLPolicyError("Schema inválido para validar flags.")
+        safe_flags = {name.casefold() for name in raw_safe_flags}
+        if len(safe_flags) != len(raw_safe_flags) or not safe_flags <= FLAG_NAMES:
+            raise SQLPolicyError("Schema inválido para validar flags.")
         folded_categories = {str(key).casefold(): value for key, value in category_values.items()}
         fields: dict[str, _Field] = {}
         for column in table["columns"]:
@@ -124,6 +133,13 @@ def _catalog(schema: dict) -> dict[str, dict[str, _Field]]:
             name = column["name"].casefold()
             if name in fields:
                 raise SQLPolicyError("Schema inválido ou com coluna duplicada.")
+            if name in safe_flags:
+                column_type = column.get("type")
+                declared_type = column.get("declared_type")
+                approved_integer = column_type == "INTEGER" and declared_type is None
+                approved_boolean = column_type == "NUMERIC" and declared_type == "BOOLEAN"
+                if column.get("primary_key") or not (approved_integer or approved_boolean):
+                    raise SQLPolicyError("Schema inválido para validar flags.")
             raw_values = folded_categories.get(name)
             values: frozenset[str] | None = None
             if column.get("primary_key") or name == "id" or name.endswith("_id"):
@@ -138,8 +154,8 @@ def _catalog(schema: dict) -> dict[str, dict[str, _Field]]:
                 kind = "category"
             elif name in _EVENT_DATES:
                 kind = "date"
-            elif name in _FLAGS:
-                kind = "flag"
+            elif name in FLAG_NAMES:
+                kind = "flag" if name in safe_flags else "private"
             elif name in _MEASURES and any(
                 affinity in str(column.get("type", "")).upper() for affinity in _NUMERIC_AFFINITIES
             ):
@@ -147,6 +163,8 @@ def _catalog(schema: dict) -> dict[str, dict[str, _Field]]:
             else:
                 kind = "private"
             fields[name] = _Field(kind, name, table_name, values)
+        if not safe_flags <= fields.keys():
+            raise SQLPolicyError("Schema inválido para validar flags.")
         catalog[table_name] = fields
     return catalog
 
@@ -219,15 +237,20 @@ def _validate_select(
     if group:
         for expression in group.expressions:
             kind, key = _group_dimension(expression, scope, catalog, ctes)
-            if kind not in {"category", "month"} or key is None:
+            if kind not in {"category", "flag", "month"} or key is None:
                 raise SQLPolicyError("Agrupamento por identificador ou dimensão não aprovada.")
             group_keys.add(key)
     if query.args.get("having"):
         _predicate(query.args["having"].this, scope, catalog, ctes)
 
     if any(output.kind == "aggregate_date" for output in outputs):
-        if group_keys or any(output.kind in {"category", "month"} for output in outputs):
+        if group_keys or any(output.kind in {"category", "flag", "month"} for output in outputs):
             raise SQLPolicyError("MAX/MIN de data só é permitido como agregado sem dimensão.")
+
+    if any(output.kind == "flag" for output in outputs) and not any(
+        output.kind == "metric" for output in outputs
+    ):
+        raise SQLPolicyError("Flag só pode ser projetada com uma métrica agregada.")
 
     if any(source.table is not None for source in scope.sources.values()) and not group_keys:
         locally_aggregated = any(
@@ -238,7 +261,7 @@ def _validate_select(
             raise SQLPolicyError("Projeção sobre tabela real precisa ser agregada.")
 
     for output in outputs:
-        if output.kind in {"category", "month"} and output.key not in group_keys:
+        if output.kind in {"category", "flag", "month"} and output.key not in group_keys:
             # A previously grouped CTE is a safe relation; a base table cannot
             # return one raw category per source row.
             if any(source.table is not None for source in scope.sources.values()):
@@ -248,8 +271,21 @@ def _validate_select(
     if order:
         for ordered in order.expressions:
             expression = ordered.this if isinstance(ordered, exp.Ordered) else ordered
-            kind, _, _ = _value(expression, scope, catalog, ctes, aliases=True)
-            if kind not in {"category", "month", "metric", "aggregate_date", "aggregate_month"}:
+            kind, key, _ = _value(expression, scope, catalog, ctes, aliases=True)
+            if (
+                kind == "flag"
+                and key not in group_keys
+                and any(source.table is not None for source in scope.sources.values())
+            ):
+                raise SQLPolicyError("ORDER BY de flag exige agrupamento pela mesma flag.")
+            if kind not in {
+                "category",
+                "flag",
+                "month",
+                "metric",
+                "aggregate_date",
+                "aggregate_month",
+            }:
                 raise SQLPolicyError("ORDER BY identificador ou coluna privada não permitido.")
     limit = query.args.get("limit")
     if limit and (not isinstance(limit.expression, exp.Literal) or not limit.expression.is_int):
@@ -476,7 +512,7 @@ def _projection(
     ctes: dict[str, dict[str, _Field]],
 ) -> tuple[str, str | None, _Field]:
     kind, key, field = _value(expression, scope, catalog, ctes)
-    if kind not in {"category", "month", "metric", "aggregate_date", "aggregate_month"}:
+    if kind not in {"category", "flag", "month", "metric", "aggregate_date", "aggregate_month"}:
         raise SQLPolicyError("Projeção deve conter métrica agregada ou dimensão aprovada.")
     return kind, key, field
 

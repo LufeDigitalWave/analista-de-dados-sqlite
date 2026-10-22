@@ -122,6 +122,21 @@ def test_can_run_multiple_queries_and_select_second_result(store):
     assert answer.chart.kind == "bar"
 
 
+def test_cannot_select_stale_query_after_a_new_successful_result(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        ("run_sql", {"sql": "SELECT COUNT(*) FROM eventos", "purpose": "Contar todos"}),
+        (
+            "run_sql",
+            {"sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App'", "purpose": "Filtrar App"},
+        ),
+        finish(answer="Há dois eventos no App.", query_number=1),
+    )
+
+    with pytest.raises(AgentError, match="última consulta"):
+        DataAnalyst(store, model).ask("Quantos eventos ocorreram no App?")
+
+
 def test_retries_after_empty_group_instead_of_claiming_no_data(store):
     model = ScriptedModel(
         ("inspect_schema", {}),
@@ -200,6 +215,341 @@ def test_accepts_confirmed_zero_after_category_distribution(store):
     assert answer.data.rows == ((0,),)
 
 
+def test_filtered_distribution_does_not_verify_zero(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT canal, COUNT(*) FROM eventos WHERE canal = 'App' GROUP BY canal",
+                "purpose": "Ver distribuição filtrada",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar interseção",
+            },
+        ),
+        finish(answer="Nenhum evento.", query_number=2),
+        finish(answer="Nenhum evento.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(store, model).ask("Há eventos simultaneamente nos dois canais?")
+
+
+def test_distribution_must_project_the_grouped_dimension_to_verify_zero(store):
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos GROUP BY canal",
+                "purpose": "Contar grupos sem mostrar os canais",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar interseção",
+            },
+        ),
+        finish(answer="Nenhum evento.", query_number=2),
+        finish(answer="Nenhum evento.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(store, model).ask("Há eventos simultaneamente nos dois canais?")
+
+
+def test_truncated_distribution_does_not_verify_zero(store):
+    limited_store = SQLiteReadOnly(store.path, row_limit=1, category_fields={("eventos", "canal")})
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT canal, COUNT(*) FROM eventos GROUP BY canal ORDER BY canal",
+                "purpose": "Ver distribuição limitada",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar interseção",
+            },
+        ),
+        finish(answer="Nenhum evento.", query_number=2),
+        finish(answer="Nenhum evento.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(limited_store, model).ask("Há eventos simultaneamente nos dois canais?")
+
+
+def test_joined_probe_that_drops_rows_does_not_verify_zero(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.executescript(
+            "CREATE TABLE marcadores (id INTEGER PRIMARY KEY, evento_id INTEGER);"
+            "INSERT INTO marcadores(evento_id) VALUES (1);"
+        )
+    probe_sql = (
+        "SELECT e.canal, COUNT(*) FROM eventos AS e "
+        "JOIN marcadores AS m ON m.evento_id = e.id GROUP BY e.canal"
+    )
+    assert store.run_sql(
+        "SELECT canal, COUNT(*) FROM eventos GROUP BY canal ORDER BY canal"
+    ).rows == (
+        ("App", 1),
+        ("WhatsApp", 1),
+    )
+    assert store.run_sql(probe_sql).rows == (("App", 1),)
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        ("run_sql", {"sql": probe_sql, "purpose": "Ver distribuição após junção"}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE canal = 'App' AND canal = 'WhatsApp'",
+                "purpose": "Contar interseção",
+            },
+        ),
+        finish(answer="Nenhum evento.", query_number=2),
+        finish(answer="Nenhum evento.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(store, model).ask("Há eventos simultaneamente nos dois canais?")
+
+
+def test_other_dimension_distribution_does_not_verify_zero_on_date(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("ALTER TABLE eventos ADD COLUMN data_contato TEXT")
+        connection.execute("UPDATE eventos SET data_contato = '2024-01-01'")
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {"sql": "SELECT canal, COUNT(*) FROM eventos GROUP BY canal", "purpose": "Ver canais"},
+        ),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE date(data_contato) >= '2030-01-01'",
+                "purpose": "Contar período",
+            },
+        ),
+        finish(answer="Não houve eventos no período.", query_number=2),
+        finish(answer="Não houve eventos no período.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(store, model).ask("Há eventos a partir de 2030?")
+
+
+def test_date_extreme_verifies_zero_on_the_same_date_column(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("ALTER TABLE eventos ADD COLUMN data_contato TEXT")
+        connection.execute("UPDATE eventos SET data_contato = '2024-01-01'")
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT MAX(date(data_contato)) AS fim FROM eventos",
+                "purpose": "Verificar data máxima",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE date(data_contato) >= '2030-01-01'",
+                "purpose": "Contar período",
+            },
+        ),
+        finish(answer="Nenhum evento a partir de 2030.", query_number=2),
+    )
+
+    answer = DataAnalyst(store, model).ask("Há eventos a partir de 2030?")
+    assert answer.data is not None
+    assert answer.data.rows == ((0,),)
+
+
+def test_date_extreme_must_be_projected_to_verify_zero(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("ALTER TABLE eventos ADD COLUMN data_contato TEXT")
+        connection.execute("UPDATE eventos SET data_contato = '2024-01-01'")
+    probe_sql = "SELECT COUNT(*) AS n FROM eventos ORDER BY MAX(date(data_contato))"
+    assert store.run_sql(probe_sql).rows == ((2,),)
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        ("run_sql", {"sql": probe_sql, "purpose": "Contar eventos"}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT COUNT(*) FROM eventos WHERE date(data_contato) >= '2030-01-01'",
+                "purpose": "Contar período",
+            },
+        ),
+        finish(answer="Nenhum evento a partir de 2030.", query_number=2),
+        finish(answer="Nenhum evento a partir de 2030.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(store, model).ask("Há eventos a partir de 2030?")
+
+
+@pytest.mark.parametrize(
+    ("flag", "present_value", "missing_value"),
+    (("resolvido", 1, 0), ("interagiu", 0, 1)),
+)
+def test_safe_flag_distribution_can_verify_zero(
+    store, flag: str, present_value: int, missing_value: int
+):
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"ALTER TABLE eventos ADD COLUMN {flag} INTEGER")
+        connection.execute(f"UPDATE eventos SET {flag} = ?", (present_value,))
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": f"SELECT {flag}, COUNT(*) FROM eventos GROUP BY {flag}",
+                "purpose": "Verificar distribuição da flag",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": f"SELECT COUNT(*) FROM eventos WHERE {flag} = {missing_value}",
+                "purpose": "Contar valor ausente",
+            },
+        ),
+        finish(answer="Nenhum evento corresponde à flag.", query_number=2),
+    )
+
+    answer = DataAnalyst(store, model).ask("Há eventos com a flag ausente?")
+    assert answer.data is not None
+    assert answer.data.rows == ((0,),)
+
+
+def test_separate_unfiltered_probes_can_verify_category_and_date_zero(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("ALTER TABLE eventos ADD COLUMN data_contato TEXT")
+        connection.execute("UPDATE eventos SET data_contato = '2024-01-01'")
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {"sql": "SELECT canal, COUNT(*) FROM eventos GROUP BY canal", "purpose": "Ver canais"},
+        ),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT MAX(date(data_contato)) AS fim FROM eventos",
+                "purpose": "Ver data máxima",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": (
+                    "SELECT COUNT(*) FROM eventos "
+                    "WHERE canal = 'App' AND date(data_contato) >= '2030-01-01'"
+                ),
+                "purpose": "Contar período e canal",
+            },
+        ),
+        finish(answer="Nenhum evento no App a partir de 2030.", query_number=3),
+    )
+
+    answer = DataAnalyst(store, model).ask("Há eventos do App a partir de 2030?")
+    assert answer.data is not None
+    assert answer.data.rows == ((0,),)
+
+
+def test_homonymous_column_in_joined_table_does_not_verify_zero(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.executescript(
+            "CREATE TABLE outros_canais "
+            "(id INTEGER PRIMARY KEY, evento_id INTEGER, canal TEXT);"
+            "INSERT INTO outros_canais(evento_id, canal) VALUES (1, 'App'), (2, 'WhatsApp');"
+        )
+    joined_store = SQLiteReadOnly(
+        store.path,
+        category_fields={("eventos", "canal"), ("outros_canais", "canal")},
+    )
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT canal, COUNT(*) FROM outros_canais GROUP BY canal",
+                "purpose": "Ver outro canal",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": (
+                    "SELECT COUNT(*) FROM eventos AS e "
+                    "JOIN outros_canais AS o ON o.evento_id = e.id "
+                    "WHERE e.canal = 'App' AND e.canal = 'WhatsApp'"
+                ),
+                "purpose": "Contar eventos por canal",
+            },
+        ),
+        finish(answer="Nenhum evento.", query_number=2),
+        finish(answer="Nenhum evento.", query_number=2),
+    )
+
+    with pytest.raises(AgentError, match="confirmar|verifica"):
+        DataAnalyst(joined_store, model).ask("Há eventos nos dois canais?")
+
+
+def test_joined_zero_accepts_probe_from_the_filtered_source_table(store):
+    with sqlite3.connect(store.path) as connection:
+        connection.executescript(
+            "CREATE TABLE outros_canais "
+            "(id INTEGER PRIMARY KEY, evento_id INTEGER, canal TEXT);"
+            "INSERT INTO outros_canais(evento_id, canal) VALUES (1, 'App'), (2, 'WhatsApp');"
+        )
+    joined_store = SQLiteReadOnly(
+        store.path,
+        category_fields={("eventos", "canal"), ("outros_canais", "canal")},
+    )
+    model = ScriptedModel(
+        ("inspect_schema", {}),
+        (
+            "run_sql",
+            {
+                "sql": "SELECT canal, COUNT(*) FROM eventos GROUP BY canal",
+                "purpose": "Ver canal dos eventos",
+            },
+        ),
+        (
+            "run_sql",
+            {
+                "sql": (
+                    "SELECT COUNT(*) FROM eventos AS e "
+                    "JOIN outros_canais AS o ON o.evento_id = e.id "
+                    "WHERE e.canal = 'App' AND e.canal = 'WhatsApp'"
+                ),
+                "purpose": "Contar eventos por canal",
+            },
+        ),
+        finish(answer="Nenhum evento pertence aos dois canais.", query_number=2),
+    )
+
+    answer = DataAnalyst(joined_store, model).ask("Há eventos nos dois canais?")
+    assert answer.data is not None
+    assert answer.data.rows == ((0,),)
+
+
 def test_unrelated_table_count_does_not_verify_zero(store):
     with sqlite3.connect(store.path) as connection:
         connection.executescript(
@@ -256,6 +606,22 @@ def test_accepts_clarification_without_claim_or_query(store):
 
     assert answer.data is None
     assert answer.text.endswith("?")
+
+
+def test_clarification_discards_untrusted_claim_assumptions_and_chart(store):
+    untrusted_finish = finish(answer="Há 999 eventos. Qual período?", query_number=0, chart="bar")
+    untrusted_finish[1]["assumptions"] = ["Há 999 eventos"]
+    untrusted_finish[1]["x_column"] = "canal"
+    untrusted_finish[1]["y_column"] = "total"
+    model = ScriptedModel(untrusted_finish)
+
+    answer = DataAnalyst(store, model).ask("Como evoluiu?")
+
+    assert answer.text.endswith("?")
+    assert "999" not in answer.text + answer.assumptions
+    assert answer.assumptions == ""
+    assert answer.data is None
+    assert answer.chart.kind == "table"
 
 
 def test_stops_after_step_limit(store):

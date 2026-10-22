@@ -165,27 +165,27 @@ class DataAnalyst:
             raise AgentError("O modelo não indicou a consulta de evidência.", tuple(steps))
 
         if query_number == 0:
-            if not answer.strip().endswith("?"):
-                raise AgentError("Resposta sem evidência deve pedir esclarecimento.", tuple(steps))
-            result = None
-        elif 1 <= query_number <= len(successful_queries):
-            result = successful_queries[query_number - 1]
-            if _is_empty_evidence(result) and (
-                query_number != len(successful_queries)
-                or not _has_related_verification(
-                    successful_queries[: query_number - 1],
-                    successful_sql[: query_number - 1],
-                    successful_sql[query_number - 1],
-                )
-            ):
-                raise _UnverifiedEmptyResult(
-                    "Resultado vazio ou zero ainda não confirmado. Revise filtros, valores "
-                    "categóricos e período; consulte distribuição ou datas da mesma fonte "
-                    "e execute novamente antes de concluir.",
-                    tuple(steps),
-                )
-        else:
+            return Answer(
+                text="Qual período, métrica ou recorte você quer analisar?",
+                assumptions="",
+                data=None,
+                chart=ChartSpec(),
+                steps=tuple(steps),
+            )
+        if not 1 <= query_number <= len(successful_queries):
             raise AgentError("A resposta não aponta para uma consulta de evidência.", tuple(steps))
+        if query_number != len(successful_queries):
+            raise AgentError("A resposta deve usar a última consulta bem-sucedida.", tuple(steps))
+        result = successful_queries[-1]
+        if _is_empty_evidence(result) and not _has_related_verification(
+            successful_queries[:-1], successful_sql[:-1], successful_sql[-1]
+        ):
+            raise _UnverifiedEmptyResult(
+                "Resultado vazio ou zero ainda não confirmado. Revise filtros, valores "
+                "categóricos e período; consulte distribuição ou datas da mesma fonte "
+                "e execute novamente antes de concluir.",
+                tuple(steps),
+            )
 
         assumptions = arguments.get("assumptions", [])
         if not isinstance(assumptions, list) or not all(
@@ -226,24 +226,84 @@ def _is_empty_evidence(result: QueryResult) -> bool:
     )
 
 
+def _source_columns(
+    expression: exp.Expression, table_aliases: dict[str, str]
+) -> set[tuple[str, str]] | None:
+    """Resolve only direct table aliases; ambiguous columns cannot verify a zero."""
+    tables = set(table_aliases.values())
+    columns: set[tuple[str, str]] = set()
+    for column in expression.find_all(exp.Column):
+        if column.table:
+            table = table_aliases.get(column.table.casefold())
+        elif len(tables) == 1:
+            table = next(iter(tables))
+        else:
+            return None
+        if table is None:
+            return None
+        columns.add((table, column.name.casefold()))
+    return columns
+
+
 def _has_related_verification(
     previous_results: list[QueryResult], previous_sql: list[str], selected_sql: str
 ) -> bool:
     """Require a related distribution or date-bound probe before a zero claim."""
     try:
         target = sqlglot.parse_one(selected_sql, read="sqlite")
-        target_tables = {table.name.casefold() for table in target.find_all(exp.Table)}
+        target_aliases = {
+            table.alias_or_name.casefold(): table.name.casefold()
+            for table in target.find_all(exp.Table)
+        }
+        target_tables = set(target_aliases.values())
+        where = target.args.get("where")
+        filtered_columns = _source_columns(where, target_aliases) if where is not None else None
+        if not target_tables or not filtered_columns:
+            return False
+        verified_columns: set[tuple[str, str]] = set()
         for result, sql in zip(previous_results, previous_sql, strict=True):
-            if _is_empty_evidence(result):
+            if result.truncated or _is_empty_evidence(result):
                 continue
             probe = sqlglot.parse_one(sql, read="sqlite")
-            probe_tables = {table.name.casefold() for table in probe.find_all(exp.Table)}
-            if target_tables & probe_tables and (
-                probe.find(exp.Group) is not None
-                or probe.find(exp.Max) is not None
-                or probe.find(exp.Min) is not None
+            if any(
+                probe.find(node) is not None
+                for node in (exp.Where, exp.Having, exp.Limit, exp.Join, exp.With, exp.Subquery)
             ):
-                return True
+                continue
+            probe_aliases = {
+                table.alias_or_name.casefold(): table.name.casefold()
+                for table in probe.find_all(exp.Table)
+            }
+            probe_tables = set(probe_aliases.values())
+            if not target_tables & probe_tables:
+                continue
+            grouped = probe.find(exp.Group)
+            grouped_columns = (
+                _source_columns(grouped, probe_aliases) if grouped is not None else set()
+            )
+            if grouped_columns is None:
+                continue
+            visible_columns: set[tuple[str, str]] = set()
+            for projection in probe.expressions:
+                expression = projection.this if isinstance(projection, exp.Alias) else projection
+                if isinstance(expression, exp.Column):
+                    columns = _source_columns(expression, probe_aliases)
+                    if columns is not None:
+                        visible_columns.update(columns)
+            grouped_columns &= visible_columns
+            extreme_columns: set[tuple[str, str]] = set()
+            for projection in probe.expressions:
+                extreme = projection.this if isinstance(projection, exp.Alias) else projection
+                if not isinstance(extreme, (exp.Min, exp.Max)):
+                    continue
+                columns = _source_columns(extreme, probe_aliases)
+                if columns is None:
+                    break
+                extreme_columns.update(columns)
+            else:
+                verified_columns.update(grouped_columns | extreme_columns)
+                if filtered_columns <= verified_columns:
+                    return True
     except Exception:
         # Validation failures here must only make a zero answer harder to claim.
         return False

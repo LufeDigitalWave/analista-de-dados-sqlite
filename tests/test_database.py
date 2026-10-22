@@ -1,10 +1,13 @@
 """Behavioral checks for the SQLite tool boundary, using synthetic data only."""
 
 import json
+import os
 import sqlite3
+from contextlib import closing
 
 import pytest
 
+import analista_dados.database as database_module
 from analista_dados.database import QueryError, SQLiteReadOnly
 
 
@@ -14,6 +17,15 @@ def make_db(tmp_path, ddl: str, rows: tuple[tuple, ...] = ()):
         connection.executescript(ddl)
         if rows:
             connection.executemany("INSERT INTO eventos (id, canal) VALUES (?, ?)", rows)
+    return path
+
+
+def make_flag_db(tmp_path, values: tuple[object, ...], declared_type: str = "INTEGER"):
+    path = tmp_path / "flags.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(f"CREATE TABLE eventos (resolvido {declared_type})")
+        connection.executemany("INSERT INTO eventos VALUES (?)", ((value,) for value in values))
+        connection.commit()
     return path
 
 
@@ -124,34 +136,24 @@ def test_schema_rejects_oversized_metadata_before_model_payload(tmp_path):
         SQLiteReadOnly(path).inspect_schema()
 
 
-def test_schema_inspection_is_cached_until_database_file_changes(tmp_path, monkeypatch):
+def test_schema_inspection_reflects_database_changes_between_calls(tmp_path):
     path = make_db(tmp_path, "CREATE TABLE eventos (id INTEGER, canal TEXT);")
     store = SQLiteReadOnly(path)
-    connect_count = 0
-    original_connect = store._connect
+    assert [table["name"] for table in store.inspect_schema()["tables"]] == ["eventos"]
 
-    def track_connect():
-        nonlocal connect_count
-        connect_count += 1
-        return original_connect()
-
-    monkeypatch.setattr(store, "_connect", track_connect)
-    assert store.inspect_schema() == store.inspect_schema()
-    assert connect_count == 1
-
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute("CREATE TABLE campanhas (id INTEGER)")
+        connection.commit()
 
     assert [table["name"] for table in store.inspect_schema()["tables"]] == [
         "campanhas",
         "eventos",
     ]
-    assert connect_count == 2
 
 
-def test_schema_cache_refreshes_when_wal_receives_new_category(tmp_path):
+def test_schema_inspection_reflects_wal_new_category(tmp_path):
     path = tmp_path / "mutable.db"
-    with sqlite3.connect(path) as writer:
+    with closing(sqlite3.connect(path)) as writer:
         writer.execute("PRAGMA journal_mode=WAL")
         writer.execute("CREATE TABLE compras (canal TEXT)")
         writer.execute("INSERT INTO compras VALUES ('App')")
@@ -164,6 +166,65 @@ def test_schema_cache_refreshes_when_wal_receives_new_category(tmp_path):
 
     assert first == [{"value": "App", "count": 1}]
     assert {item["value"] for item in second} == {"App", "Site"}
+
+
+def test_run_sql_revalidates_replaced_database_with_same_size_and_mtime(tmp_path):
+    path = tmp_path / "clientes.db"
+    replacement = tmp_path / "replacement.db"
+    for database_path, state in (
+        (path, "Seguro"),
+        (replacement, "person@example.invalid"),
+    ):
+        with closing(sqlite3.connect(database_path)) as connection:
+            connection.execute("CREATE TABLE clientes (estado TEXT)")
+            connection.execute("INSERT INTO clientes VALUES (?)", (state,))
+            connection.commit()
+
+    store = SQLiteReadOnly(path)
+    assert store.inspect_schema()["tables"][0]["categorical_values"]["estado"] == [
+        {"value": "Seguro", "count": 1}
+    ]
+    original_stat = path.stat()
+    assert replacement.stat().st_size == original_stat.st_size
+    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    os.replace(replacement, path)
+    assert (path.stat().st_size, path.stat().st_mtime_ns) == (
+        original_stat.st_size,
+        original_stat.st_mtime_ns,
+    )
+    with closing(sqlite3.connect(path)) as observer:
+        assert observer.execute("SELECT estado FROM clientes").fetchone() == (
+            "person@example.invalid",
+        )
+
+    with pytest.raises(QueryError):
+        store.run_sql("SELECT estado, COUNT(*) FROM clientes GROUP BY estado")
+
+
+def test_run_sql_uses_approved_wal_snapshot_after_concurrent_update(tmp_path, monkeypatch):
+    path = tmp_path / "clientes-wal.db"
+    with closing(sqlite3.connect(path)) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE clientes (estado TEXT)")
+        writer.execute("INSERT INTO clientes VALUES ('Seguro')")
+        writer.commit()
+
+        original_validate_sql = database_module.validate_sql
+
+        def update_after_validation(sql, schema):
+            original_validate_sql(sql, schema)
+            writer.execute("UPDATE clientes SET estado = ?", ("person@example.invalid",))
+            writer.commit()
+
+        monkeypatch.setattr(database_module, "validate_sql", update_after_validation)
+        result = SQLiteReadOnly(path).run_sql(
+            "SELECT estado, COUNT(*) FROM clientes GROUP BY estado"
+        )
+        assert writer.execute("SELECT estado FROM clientes").fetchone() == (
+            "person@example.invalid",
+        )
+
+    assert result.rows == (("Seguro", 1),)
 
 
 def test_schema_discovery_respects_timeout(tmp_path):
@@ -198,18 +259,40 @@ def test_denies_direct_personal_column_but_allows_aggregate(tmp_path):
     assert store.run_sql("SELECT COUNT(*) AS total FROM clientes").rows == ((1,),)
 
 
-def test_interrupts_query_after_time_limit(tmp_path):
+def test_interrupts_query_after_time_limit(tmp_path, monkeypatch):
     path = make_db(
         tmp_path,
         "CREATE TABLE eventos (id INTEGER, canal TEXT);",
         tuple((index, "chat") for index in range(1_000)),
     )
-    store = SQLiteReadOnly(path, timeout_seconds=0.0001)
+    store = SQLiteReadOnly(path, timeout_seconds=0.3)
+    expensive_sql = (
+        "SELECT COUNT(*) FROM eventos AS a CROSS JOIN eventos AS b CROSS JOIN eventos AS c"
+    )
+    query_started = False
+    original_connect = store._connect
+
+    class TrackedConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def execute(self, sql, *args):
+            nonlocal query_started
+            if sql == expensive_sql:
+                query_started = True
+            return self.connection.execute(sql, *args)
+
+        def close(self):
+            self.connection.close()
+
+    monkeypatch.setattr(store, "_connect", lambda: TrackedConnection(original_connect()))
 
     with pytest.raises(QueryError, match="tempo"):
-        store.run_sql(
-            "SELECT COUNT(*) FROM eventos AS a CROSS JOIN eventos AS b CROSS JOIN eventos AS c"
-        )
+        store.run_sql(expensive_sql)
+    assert query_started
 
 
 def test_rejects_out_of_range_limits(tmp_path):
@@ -465,3 +548,150 @@ def test_rejects_category_literal_not_present_in_database(tmp_path, sql):
 
     with pytest.raises(QueryError, match="(?i)valor categórico"):
         SQLiteReadOnly(path).run_sql(sql)
+
+
+def test_schema_marks_only_binary_integer_flags_without_value_previews(tmp_path):
+    path = tmp_path / "flag-schema.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "CREATE TABLE eventos (resolvido INTEGER, interagiu INTEGER, idade INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO eventos VALUES (?, ?, ?)",
+            ((0, 1, 0), (1, 0, 1), (None, None, 1)),
+        )
+        connection.commit()
+
+    table = SQLiteReadOnly(path).inspect_schema()["tables"][0]
+    assert table.get("safe_flag_columns") == ["resolvido", "interagiu"]
+    assert "categorical_values" not in table
+
+
+def test_schema_marks_exact_boolean_flags_without_exposing_values(tmp_path):
+    path = make_flag_db(tmp_path, (0, 1, None), "BOOLEAN")
+    store = SQLiteReadOnly(path)
+
+    table = store.inspect_schema()["tables"][0]
+    assert table["columns"][0]["type"] == "NUMERIC"
+    assert table["columns"][0].get("declared_type") == "BOOLEAN"
+    assert table.get("safe_flag_columns") == ["resolvido"]
+    assert "categorical_values" not in table
+    assert store.run_sql(
+        "SELECT resolvido, COUNT(*) FROM eventos GROUP BY resolvido ORDER BY resolvido"
+    ).rows == ((None, 1), (0, 1), (1, 1))
+
+
+def test_run_sql_groups_safe_flag_but_rejects_raw_projection(tmp_path):
+    path = make_flag_db(tmp_path, (0, 0, 1, None))
+    store = SQLiteReadOnly(path)
+
+    result = store.run_sql(
+        "SELECT resolvido, COUNT(*) AS total FROM eventos GROUP BY resolvido ORDER BY resolvido"
+    )
+    assert result.rows == ((None, 1), (0, 2), (1, 1))
+    for sql in (
+        "SELECT resolvido FROM eventos",
+        "SELECT resolvido FROM eventos GROUP BY resolvido",
+        "SELECT COUNT(*) FROM eventos ORDER BY resolvido",
+    ):
+        with pytest.raises(QueryError):
+            store.run_sql(sql)
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "storage_type"),
+    (
+        (2, "integer"),
+        (0.5, "real"),
+        ("person@example.invalid", "text"),
+        (b"\x00", "blob"),
+    ),
+)
+def test_integer_flag_with_out_of_domain_storage_is_private(tmp_path, invalid_value, storage_type):
+    path = make_flag_db(tmp_path, (0, 1, None, invalid_value))
+    with closing(sqlite3.connect(path)) as observer:
+        assert observer.execute(
+            "SELECT typeof(resolvido) FROM eventos WHERE rowid = 4"
+        ).fetchone() == (storage_type,)
+
+    store = SQLiteReadOnly(path)
+    table = store.inspect_schema()["tables"][0]
+    assert "safe_flag_columns" not in table
+    assert "person@example.invalid" not in json.dumps(table)
+    for sql in (
+        "SELECT resolvido, COUNT(*) FROM eventos GROUP BY resolvido",
+        "SELECT COUNT(*) FROM eventos WHERE resolvido = 0",
+        "SELECT COUNT(resolvido) FROM eventos",
+    ):
+        with pytest.raises(QueryError):
+            store.run_sql(sql)
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "values"),
+    (
+        ("TEXT", ("0", "1")),
+        ("REAL", (0.0, 1.0)),
+        ("NUMERIC", (0, 1)),
+        ("BOOL", (0, 1)),
+        ("BOOLEAN(1)", (0, 1)),
+    ),
+)
+def test_unapproved_declared_flag_type_remains_private(tmp_path, declared_type, values):
+    path = make_flag_db(tmp_path, values, declared_type)
+    store = SQLiteReadOnly(path)
+    assert "safe_flag_columns" not in store.inspect_schema()["tables"][0]
+    if declared_type == "TEXT":
+        with closing(sqlite3.connect(path)) as observer:
+            assert observer.execute(
+                "SELECT DISTINCT typeof(resolvido) FROM eventos"
+            ).fetchall() == [("text",)]
+    with pytest.raises(QueryError):
+        store.run_sql("SELECT COUNT(*) FROM eventos WHERE resolvido = 0")
+
+
+@pytest.mark.parametrize("invalid_value", (2, 0.5, "pessoa@example.invalid", b"\x00"))
+def test_boolean_declared_flag_with_nonbinary_storage_is_private(tmp_path, invalid_value):
+    path = make_flag_db(tmp_path, (0, 1, None, invalid_value), "BOOLEAN")
+    store = SQLiteReadOnly(path)
+    table = store.inspect_schema()["tables"][0]
+    assert table["columns"][0].get("declared_type") == "BOOLEAN"
+    assert "safe_flag_columns" not in table
+    assert "pessoa@example.invalid" not in json.dumps(table)
+    for sql in (
+        "SELECT resolvido, COUNT(*) FROM eventos GROUP BY resolvido",
+        "SELECT COUNT(*) FROM eventos WHERE resolvido = 0",
+        "SELECT COUNT(resolvido) FROM eventos",
+    ):
+        with pytest.raises(QueryError):
+            store.run_sql(sql)
+
+
+def test_run_sql_uses_safe_flag_snapshot_across_wal_update(tmp_path, monkeypatch):
+    path = tmp_path / "flag-wal.db"
+    with closing(sqlite3.connect(path)) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE eventos (resolvido INTEGER)")
+        writer.executemany("INSERT INTO eventos VALUES (?)", ((0,), (1,)))
+        writer.commit()
+
+        original_validate_sql = database_module.validate_sql
+
+        def update_after_validation(sql, schema):
+            original_validate_sql(sql, schema)
+            writer.execute(
+                "UPDATE eventos SET resolvido = ? WHERE resolvido = 0",
+                ("person@example.invalid",),
+            )
+            writer.commit()
+
+        monkeypatch.setattr(database_module, "validate_sql", update_after_validation)
+        result = SQLiteReadOnly(path).run_sql(
+            "SELECT resolvido, COUNT(*) FROM eventos GROUP BY resolvido ORDER BY resolvido"
+        )
+        assert writer.execute("SELECT resolvido FROM eventos ORDER BY rowid").fetchall() == [
+            ("person@example.invalid",),
+            (1,),
+        ]
+
+    assert result.rows == ((0, 1), (1, 1))

@@ -6,12 +6,11 @@ import sqlite3
 import unicodedata
 from collections.abc import Iterable
 from contextlib import closing
-from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
 
 from .models import QueryResult
-from .sql_policy import SQLPolicyError, validate_sql
+from .sql_policy import FLAG_NAMES, SQLPolicyError, validate_sql
 
 PROTECTED_TOKENS = frozenset({"email", "cpf", "telefone", "endereco", "celular"})
 ALLOWED_ACTIONS = frozenset(
@@ -110,23 +109,14 @@ class SQLiteReadOnly:
         self.category_fields = frozenset(
             (table.casefold(), column.casefold()) for table, column in approved
         )
-        self._schema_cache: tuple[tuple[int, int, int, int], dict] | None = None
 
     def inspect_schema(self) -> dict:
-        try:
-            stat = self.path.stat()
-            try:
-                wal_stat = Path(f"{self.path}-wal").stat()
-                wal_fingerprint = (wal_stat.st_size, wal_stat.st_mtime_ns)
-            except FileNotFoundError:
-                wal_fingerprint = (-1, -1)
-        except OSError as exc:
-            raise QueryError("Banco SQLite não encontrado.") from exc
-        fingerprint = (stat.st_size, stat.st_mtime_ns, *wal_fingerprint)
-        if self._schema_cache is not None and self._schema_cache[0] == fingerprint:
-            return deepcopy(self._schema_cache[1])
-
         deadline = perf_counter() + self.timeout_seconds
+        with closing(self._connect()) as connection:
+            return self._inspect_schema(connection, deadline)
+
+    def _inspect_schema(self, connection: sqlite3.Connection, deadline: float) -> dict:
+        """Read policy metadata from the same transaction later used by SQL."""
         time_expired = False
 
         def check_deadline() -> int:
@@ -135,91 +125,113 @@ class SQLiteReadOnly:
             return int(time_expired)
 
         try:
-            with closing(self._connect()) as connection:
-                connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
-                connection.set_progress_handler(check_deadline, 1000)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+            connection.set_progress_handler(check_deadline, 1000)
+            if check_deadline():
+                raise QueryError("Leitura do schema interrompida por limite de tempo.")
+            connection.execute("BEGIN")
+            names = connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            schema: dict = {"tables": []}
+            for (name,) in names:
+                quoted = '"' + name.replace('"', '""') + '"'
+                column_rows = list(connection.execute(f"PRAGMA table_info({quoted})"))
+                columns = [
+                    {
+                        "name": row[1],
+                        "type": _sqlite_affinity(row[2]),
+                        "nullable": not bool(row[3] or row[5]),
+                        "primary_key": bool(row[5]),
+                        **(
+                            {"declared_type": "BOOLEAN"}
+                            if row[1].casefold() in FLAG_NAMES and row[2].upper() == "BOOLEAN"
+                            else {}
+                        ),
+                    }
+                    for row in column_rows
+                ]
+                foreign_keys = [
+                    {"table": row[2], "from": row[3], "to": row[4]}
+                    for row in connection.execute(f"PRAGMA foreign_key_list({quoted})")
+                ]
+                table: dict = {
+                    "name": name,
+                    "columns": columns,
+                    "foreign_keys": foreign_keys,
+                }
+                categorical_values = {}
+                for column in columns:
+                    category_name = column["name"]
+                    if (
+                        (name.casefold(), category_name.casefold()) not in self.category_fields
+                        or column["primary_key"]
+                        or category_name.casefold().endswith("_id")
+                        or _is_protected_column(category_name)
+                        or column["type"] != "TEXT"
+                    ):
+                        continue
+                    quoted_column = '"' + category_name.replace('"', '""') + '"'
+                    categories = connection.execute(
+                        f"SELECT {quoted_column}, COUNT(*) FROM {quoted} "
+                        f"WHERE {quoted_column} IS NOT NULL GROUP BY {quoted_column} "
+                        f"ORDER BY COUNT(*) DESC, {quoted_column} LIMIT ?",
+                        (MAX_CATEGORY_VALUES + 1,),
+                    ).fetchall()
+                    if len(categories) <= MAX_CATEGORY_VALUES and all(
+                        isinstance(value, str)
+                        and len(value) <= 80
+                        and value.isprintable()
+                        and "@" not in value
+                        and not any(character.isdigit() for character in value)
+                        and "://" not in value
+                        and "www." not in value.casefold()
+                        for value, _ in categories
+                    ):
+                        categorical_values[category_name] = [
+                            {"value": value, "count": count} for value, count in categories
+                        ]
+                if categorical_values:
+                    table["categorical_values"] = categorical_values
+                safe_flag_columns = []
+                for column in columns:
+                    flag_name = column["name"]
+                    if (
+                        flag_name.casefold() not in FLAG_NAMES
+                        or not (
+                            column["type"] == "INTEGER" or column.get("declared_type") == "BOOLEAN"
+                        )
+                        or column["primary_key"]
+                    ):
+                        continue
+                    quoted_flag = '"' + flag_name.replace('"', '""') + '"'
+                    invalid_flag = connection.execute(
+                        f"SELECT 1 FROM {quoted} WHERE {quoted_flag} IS NOT NULL "
+                        f"AND (typeof({quoted_flag}) != 'integer' "
+                        f"OR {quoted_flag} NOT IN (0, 1)) LIMIT 1"
+                    ).fetchone()
+                    if invalid_flag is None:
+                        safe_flag_columns.append(flag_name)
+                if safe_flag_columns:
+                    table["safe_flag_columns"] = safe_flag_columns
+                schema["tables"].append(table)
+                if _schema_output_size(schema) > MAX_RESULT_BYTES:
+                    raise QueryError(
+                        "O schema excede o limite total de 128 KiB; use um banco menor."
+                    )
                 if check_deadline():
                     raise QueryError("Leitura do schema interrompida por limite de tempo.")
-                names = connection.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-                ).fetchall()
-                schema: dict = {"tables": []}
-                for (name,) in names:
-                    quoted = '"' + name.replace('"', '""') + '"'
-                    columns = [
-                        {
-                            "name": row[1],
-                            "type": _sqlite_affinity(row[2]),
-                            "nullable": not bool(row[3] or row[5]),
-                            "primary_key": bool(row[5]),
-                        }
-                        for row in connection.execute(f"PRAGMA table_info({quoted})")
-                    ]
-                    foreign_keys = [
-                        {"table": row[2], "from": row[3], "to": row[4]}
-                        for row in connection.execute(f"PRAGMA foreign_key_list({quoted})")
-                    ]
-                    table: dict = {
-                        "name": name,
-                        "columns": columns,
-                        "foreign_keys": foreign_keys,
-                    }
-                    categorical_values = {}
-                    for column in columns:
-                        category_name = column["name"]
-                        if (
-                            (name.casefold(), category_name.casefold()) not in self.category_fields
-                            or column["primary_key"]
-                            or category_name.casefold().endswith("_id")
-                            or _is_protected_column(category_name)
-                            or column["type"] != "TEXT"
-                        ):
-                            continue
-                        quoted_column = '"' + category_name.replace('"', '""') + '"'
-                        categories = connection.execute(
-                            f"SELECT {quoted_column}, COUNT(*) FROM {quoted} "
-                            f"WHERE {quoted_column} IS NOT NULL GROUP BY {quoted_column} "
-                            f"ORDER BY COUNT(*) DESC, {quoted_column} LIMIT ?",
-                            (MAX_CATEGORY_VALUES + 1,),
-                        ).fetchall()
-                        if len(categories) <= MAX_CATEGORY_VALUES and all(
-                            isinstance(value, str)
-                            and len(value) <= 80
-                            and value.isprintable()
-                            and "@" not in value
-                            and not any(character.isdigit() for character in value)
-                            and "://" not in value
-                            and "www." not in value.casefold()
-                            for value, _ in categories
-                        ):
-                            categorical_values[category_name] = [
-                                {"value": value, "count": count} for value, count in categories
-                            ]
-                    if categorical_values:
-                        table["categorical_values"] = categorical_values
-                    schema["tables"].append(table)
-                    if _schema_output_size(schema) > MAX_RESULT_BYTES:
-                        raise QueryError(
-                            "O schema excede o limite total de 128 KiB; use um banco menor."
-                        )
-                    if check_deadline():
-                        raise QueryError("Leitura do schema interrompida por limite de tempo.")
         except sqlite3.Error as exc:
             if time_expired:
                 raise QueryError("Leitura do schema interrompida por limite de tempo.") from exc
             raise QueryError("Não foi possível ler o schema do banco SQLite.") from exc
-        self._schema_cache = (fingerprint, schema)
-        return deepcopy(schema)
+        return schema
 
     def run_sql(self, sql: str) -> QueryResult:
         statement = sql.strip()
         if not re.match(r"^(?:SELECT|WITH)\b", statement, re.IGNORECASE):
             raise QueryError("Apenas consultas SELECT/WITH são permitidas.")
-        try:
-            validate_sql(statement, self.inspect_schema())
-        except SQLPolicyError as exc:
-            raise QueryError(str(exc)) from exc
         started = perf_counter()
         deadline = started + self.timeout_seconds
         blocked: list[str] = []
@@ -248,9 +260,15 @@ class SQLiteReadOnly:
 
         try:
             with closing(self._connect()) as connection:
-                connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+                schema = self._inspect_schema(connection, deadline)
+                try:
+                    validate_sql(statement, schema)
+                except SQLPolicyError as exc:
+                    raise QueryError(str(exc)) from exc
                 connection.set_authorizer(authorize)
                 connection.set_progress_handler(check_deadline, 1000)
+                if check_deadline():
+                    raise QueryError("Consulta interrompida por limite de tempo.")
                 cursor = connection.execute(statement)
                 columns = tuple(column[0] for column in cursor.description)
                 if _tool_output_size(columns, []) > MAX_RESULT_BYTES:

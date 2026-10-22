@@ -6,5 +6,8 @@ secondaryBackgroundColor = "#E8F0EF"
 textColor = "#102A32"
 font = "sans serif"
 
+[browser]
+gatherUsageStats = false
+
 [server]
 address = "127.0.0.1"

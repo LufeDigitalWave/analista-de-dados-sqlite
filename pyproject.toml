@@ -12,7 +12,7 @@ dependencies = [
     "openai>=3,<4",
     "pandas>=3,<4",
     "sqlglot==30.24.0",
-    "streamlit>=1.40,<2",
+    "streamlit>=1.65,<2",
 ]
 
 [project.optional-dependencies]

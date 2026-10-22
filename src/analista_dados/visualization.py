@@ -8,10 +8,28 @@ import pandas as pd
 from analista_dados.models import ChartSpec, QueryResult
 
 _TEMPORAL_PARTS = {"ano", "mes", "mês", "data", "dia", "semana", "trimestre"}
+_ISO_MONTH = re.compile(r"[0-9]{4}-(?:0[1-9]|1[0-2])")
 
 
 def _is_temporal_column(column: str) -> bool:
     return any(part in _TEMPORAL_PARTS for part in re.split(r"[\W_]+", column.casefold()))
+
+
+def _chart_frame_with_month_axis(frame: pd.DataFrame, x_column: str, kind: str) -> pd.DataFrame:
+    """Give monthly line charts a date axis without changing their source table."""
+    if kind != "line":
+        return frame
+    labels = frame[x_column]
+    is_iso_month = labels.map(
+        lambda value: isinstance(value, str) and _ISO_MONTH.fullmatch(value) is not None
+    )
+    if not is_iso_month.all():
+        return frame
+    dates = pd.to_datetime(labels, format="%Y-%m", errors="coerce")
+    if dates.isna().any():
+        return frame
+    frame[x_column] = dates
+    return frame
 
 
 @dataclass(frozen=True)
@@ -102,7 +120,9 @@ def prepare_visualization(
         if kind == "line" and table[x_column].duplicated().any():
             return fallback
         frame = table[[x_column, y_column]].copy()
-        return PreparedVisualization(kind, frame, table, x_column, (y_column,))
+        return PreparedVisualization(
+            kind, _chart_frame_with_month_axis(frame, x_column, kind), table, x_column, (y_column,)
+        )
 
     if (
         series_column not in table.columns
@@ -124,4 +144,6 @@ def prepare_visualization(
     y_columns = tuple(name for name in names if name != x_column)
     if not y_columns:
         return fallback
-    return PreparedVisualization(kind, frame, table, x_column, y_columns)
+    return PreparedVisualization(
+        kind, _chart_frame_with_month_axis(frame, x_column, kind), table, x_column, y_columns
+    )

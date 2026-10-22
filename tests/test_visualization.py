@@ -1,5 +1,7 @@
 """Contratos de apresentação de resultados SQL, sem chamadas ao modelo."""
 
+import pandas as pd
+
 from analista_dados.models import ChartSpec, QueryResult
 from analista_dados.visualization import prepare_visualization
 
@@ -49,9 +51,49 @@ def test_line_chart_pivots_channel_series_without_losing_source_table():
     assert list(view.frame.columns)[0] == "mes"
     assert set(view.y_columns) == {"Chat", "E-mail"}
     indexed = view.frame.set_index("mes")
-    assert indexed.loc["2025-01", "Chat"] == 2
-    assert indexed.loc["2025-02", "E-mail"] == 4
+    assert indexed.loc[pd.Timestamp("2025-01-01"), "Chat"] == 2
+    assert indexed.loc[pd.Timestamp("2025-02-01"), "E-mail"] == 4
     assert len(view.table) == 4
+
+
+def test_monthly_line_chart_uses_distinct_year_dates_without_changing_table():
+    result = _result(("mes", "total"), (("2024-07", 1), ("2025-07", 2)))
+
+    view = prepare_visualization(result, ChartSpec("line", "mes", "total", ""))
+
+    assert view.kind == "line"
+    assert pd.api.types.is_datetime64_any_dtype(view.frame["mes"])
+    assert list(view.frame["mes"]) == [
+        pd.Timestamp("2024-07-01"),
+        pd.Timestamp("2025-07-01"),
+    ]
+    assert list(view.table["mes"]) == ["2024-07", "2025-07"]
+
+
+def test_monthly_line_chart_with_series_converts_only_chart_axis():
+    result = _result(
+        ("mes", "canal", "total"),
+        (("2024-07", "Chat", 1), ("2025-07", "Chat", 2)),
+    )
+
+    view = prepare_visualization(result, ChartSpec("line", "mes", "total", "canal"))
+
+    assert view.kind == "line"
+    assert pd.api.types.is_datetime64_any_dtype(view.frame["mes"])
+    assert list(view.frame.set_index("mes").loc[:, "Chat"]) == [1, 2]
+    assert list(view.table["mes"]) == ["2024-07", "2025-07"]
+
+
+def test_invalid_or_mixed_month_labels_remain_literal():
+    for months in (("2025-13", "2025-01"), ("2025-01", "2025-01-01")):
+        result = _result(("mes", "total"), ((months[0], 1), (months[1], 2)))
+
+        view = prepare_visualization(result, ChartSpec("line", "mes", "total", ""))
+
+        assert view.kind == "line"
+        assert not pd.api.types.is_datetime64_any_dtype(view.frame["mes"])
+        assert list(view.frame["mes"]) == list(months)
+        assert list(view.table["mes"]) == list(months)
 
 
 def test_unknown_axis_falls_back_to_table():
@@ -147,7 +189,7 @@ def test_manual_line_override_infers_unique_channel_series_for_temporal_trend():
     assert view.kind == "line"
     assert view.x_column == "mes"
     assert set(view.y_columns) == {"Chat", "E-mail"}
-    assert view.frame.set_index("mes").loc["2025-02", "E-mail"] == 4
+    assert view.frame.set_index("mes").loc[pd.Timestamp("2025-02-01"), "E-mail"] == 4
 
 
 def test_manual_line_override_infers_series_with_explicit_temporal_axes():
@@ -167,7 +209,7 @@ def test_manual_line_override_infers_series_with_explicit_temporal_axes():
     assert view.kind == "line"
     assert view.x_column == "mes"
     assert set(view.y_columns) == {"Chat", "E-mail"}
-    assert view.frame.set_index("mes").loc["2025-02", "E-mail"] == 4
+    assert view.frame.set_index("mes").loc[pd.Timestamp("2025-02-01"), "E-mail"] == 4
 
 
 def test_line_without_series_rejects_duplicate_x_values():

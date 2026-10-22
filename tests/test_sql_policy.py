@@ -56,6 +56,7 @@ SCHEMA = {
                 _column("interagiu", "INTEGER"),
                 _column("data_envio"),
             ],
+            "safe_flag_columns": ["interagiu"],
             "categorical_values": {
                 "canal": [{"value": "WhatsApp", "count": 20}],
             },
@@ -69,6 +70,7 @@ SCHEMA = {
                 _column("data_contato"),
                 _column("telefone"),
             ],
+            "safe_flag_columns": ["resolvido"],
             "categorical_values": {
                 "canal": [
                     {"value": "Telefone", "count": 5},
@@ -78,6 +80,26 @@ SCHEMA = {
                 "tipo_contato": [{"value": "Reclamação", "count": 10}],
             },
         },
+    ]
+}
+
+SAFE_FLAG_SCHEMA = {
+    "tables": [
+        {
+            "name": "suporte",
+            "columns": [_column("resolvido", "INTEGER")],
+            "safe_flag_columns": ["resolvido"],
+        }
+    ]
+}
+
+BOOLEAN_FLAG_SCHEMA = {
+    "tables": [
+        {
+            "name": "suporte",
+            "columns": [{**_column("resolvido", "NUMERIC"), "declared_type": "BOOLEAN"}],
+            "safe_flag_columns": ["resolvido"],
+        }
     ]
 }
 
@@ -400,3 +422,79 @@ def test_rejects_text_or_binary_casts_of_aggregate_metrics(sql):
     policy = _policy()
     with pytest.raises(policy.SQLPolicyError, match="CAST|numéric|permitid"):
         policy.validate_sql(sql, SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT resolvido, COUNT(*) AS total FROM suporte GROUP BY resolvido ORDER BY resolvido",
+        "SELECT resolvido AS flag, COUNT(*) AS total FROM suporte GROUP BY resolvido ORDER BY flag",
+        "SELECT COUNT(*) FROM suporte WHERE resolvido = 0 GROUP BY resolvido",
+        "WITH distribuicao AS ("
+        "SELECT resolvido AS flag, COUNT(*) AS total FROM suporte GROUP BY resolvido"
+        ") SELECT flag, total FROM distribuicao ORDER BY flag",
+    ],
+)
+def test_allows_approved_flag_only_as_aggregate_dimension(sql):
+    _policy().validate_sql(sql, SAFE_FLAG_SCHEMA)
+
+
+def test_allows_exact_boolean_declared_flag_with_safe_marker():
+    _policy().validate_sql(
+        "SELECT resolvido, COUNT(*) FROM suporte GROUP BY resolvido ORDER BY resolvido",
+        BOOLEAN_FLAG_SCHEMA,
+    )
+
+
+@pytest.mark.parametrize("schema", (SAFE_FLAG_SCHEMA, BOOLEAN_FLAG_SCHEMA))
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT resolvido FROM suporte",
+        "SELECT resolvido FROM suporte GROUP BY resolvido",
+        "SELECT COUNT(*) FROM suporte ORDER BY resolvido",
+        "SELECT resolvido, COUNT(*) FROM suporte ORDER BY resolvido",
+    ],
+)
+def test_rejects_raw_or_unaggregated_approved_flag(sql, schema):
+    policy = _policy()
+    with pytest.raises(policy.SQLPolicyError):
+        policy.validate_sql(sql, schema)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT resolvido, COUNT(*) FROM suporte GROUP BY resolvido",
+        "SELECT COUNT(*) FROM suporte WHERE resolvido = 0",
+        "SELECT COUNT(resolvido) FROM suporte",
+    ],
+)
+def test_unapproved_flag_is_private_in_projection_filter_and_count(sql):
+    policy = _policy()
+    schema = {"tables": [{"name": "suporte", "columns": [_column("resolvido", "INTEGER")]}]}
+    with pytest.raises(policy.SQLPolicyError):
+        policy.validate_sql(sql, schema)
+
+
+@pytest.mark.parametrize(
+    ("columns", "safe_flags"),
+    [
+        ([_column("resolvido", "INTEGER")], "resolvido"),
+        ([_column("resolvido", "INTEGER")], ["resolvido", "RESOLVIDO"]),
+        ([_column("resolvido", "INTEGER")], ["ausente"]),
+        ([_column("idade", "INTEGER")], ["idade"]),
+        ([_column("resolvido", "TEXT")], ["resolvido"]),
+        ([_column("resolvido", "NUMERIC")], ["resolvido"]),
+        ([{**_column("resolvido", "NUMERIC"), "declared_type": "BOOL"}], ["resolvido"]),
+        ([{**_column("resolvido", "NUMERIC"), "declared_type": "BOOLEAN(1)"}], ["resolvido"]),
+        ([{**_column("resolvido", "TEXT"), "declared_type": "BOOLEAN"}], ["resolvido"]),
+        ([{**_column("resolvido", "INTEGER"), "declared_type": "BOOLEAN"}], ["resolvido"]),
+        ([_column("resolvido", "INTEGER", primary_key=True)], ["resolvido"]),
+    ],
+)
+def test_rejects_forged_or_malformed_safe_flag_metadata(columns, safe_flags):
+    policy = _policy()
+    schema = {"tables": [{"name": "suporte", "columns": columns, "safe_flag_columns": safe_flags}]}
+    with pytest.raises(policy.SQLPolicyError, match="(?i)schema|flag"):
+        policy.validate_sql("SELECT COUNT(*) FROM suporte", schema)
