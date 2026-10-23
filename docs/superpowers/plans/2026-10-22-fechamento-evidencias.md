@@ -76,7 +76,7 @@ numbers = [
 ```
 
 - [x] **Step 4: Executar GREEN e regressões da Q2.** Os 24 testes focados da Q2 passaram após os contraexemplos de datas isoladas e negação; a suíte completa passou no gate da Task 2.
-- [ ] **Step 5: Revisar o diff estreito da Q2 e incorporar no commit local da Task 2.** Ambas as tasks alteram `evals/live_eval.py` e `tests/test_live_eval.py` no mesmo checkout; um commit coeso após os dois gates evita estagiar parcialmente arquivos em edição. O commit não publica dados privados.
+- [x] **Step 5: Revisar o diff estreito da Q2 e incorporar no commit local da Task 2.** Ambas as tasks alteraram `evals/live_eval.py` e `tests/test_live_eval.py` no mesmo checkout; o commit `6a9d0eb` incluiu código, testes e documentação, sem dados privados.
 
 ### Task 2: Captura privada e opt-in da avaliação
 
@@ -121,7 +121,7 @@ case_record = {
 ```
 
 - [x] **Step 6: Rodar GREEN, suite completa e revisão do diff.** A árvore compartilhada passou com 372 testes, 1 skip de symlink no Windows, Ruff check/format, `pip check` e `git diff --check`. A revisão direta e independente não encontrou serialização de `steps.error`, `QueryResult` intermediário, exceção ou objeto do provedor; resta scan de segredos e commit antes da rodada real.
-- [ ] **Step 7: Commit local antes da rodada real.** Run: `git add README.md docs/superpowers/specs/2026-10-22-fechamento-evidencias-design.md docs/superpowers/plans/2026-10-22-fechamento-evidencias.md evals/live_eval.py evals/private_review.py tests/test_live_eval.py tests/test_private_review.py` e `git commit -m "feat: capture private evaluation evidence"`; depois `git status --short` deve estar vazio.
+- [x] **Step 7: Commit local antes da rodada real.** Apenas os sete arquivos listados entraram no commit `6a9d0eb`; `git status --porcelain` ficou vazio antes da avaliação. A identidade do commit foi a mesma dos commits anteriores e foi passada somente naquele comando, sem alterar a configuração global.
 
 ### Task 3: Uma rodada real e revisão humana privada
 
@@ -129,10 +129,10 @@ case_record = {
 
 **Interfaces:** `DATABASE_PATH` aponta ao anexo local e `OPENAI_API_KEY` permanece em variável privada. A CLI `python -m evals.live_eval --private-review` executa Q1–Q5 uma vez; o pacote identifica commit limpo e hash do banco antes/depois. A matriz aponta ao hash SHA-256 do JSON e não o altera.
 
-- [ ] **Step 1: Preflight sem expor valores.** Verificar presença do banco e da variável, `git status --short` vazio, destino resolvido em `<task>/work` fora de `outputs` (ou `git check-ignore work/private-review` no fallback), conteúdo rastreado via `git ls-files`, e hash do banco lido antes da rodada. Não imprimir valor da chave, dados por linha nem SQL literal.
-- [ ] **Step 2: Executar exatamente uma rodada das cinco perguntas.** Com `DATABASE_PATH` e `OPENAI_API_KEY` já configuradas no processo local, run: `.venv\Scripts\python.exe -m evals.live_eval --private-review`. Guardar somente o resumo redigido e exit code; falha/custo interrompem novas chamadas até diagnóstico.
-- [ ] **Step 3: Verificar o pacote e construir matriz privada.** Conferir JSON válido, `selected_cases=[1,2,3,4,5]`, casos tentados/concluídos, status e hash do banco igual antes/depois; revisar Q1–Q5 contra a checklist da spec. Escrever `CONFIRMADA`/`INCORRETA`/`INDETERMINADA` por caso, justificativa sem copiar respostas/SQL, nome e SHA-256 do pacote. Preservar pacote e matriz ignorados, sem sobrescrita.
-- [ ] **Step 4: Se surgir defeito novo, reproduzir offline antes de corrigir.** Criar fixture sintética que falha pelo mesmo motivo; rodar RED, corrigir mínimo, GREEN, commit e uma decisão explícita se uma **nova** rodada paga é necessária. Não selecionar a melhor de várias amostras.
+- [x] **Step 1: Preflight sem expor valores.** Banco, variável privada, commit limpo e destino fora de `outputs` foram confirmados; `git ls-files` mostrou apenas `.env.example` no filtro amplo de nomes sensíveis. O processo ampliado inicialmente esbarrou na política Git de ownership, antes de qualquer chamada ao modelo; uma exceção `safe.directory` temporária e restrita ao repositório, passada só por variáveis daquele processo, permitiu o mesmo preflight sem mudar Git global.
+- [x] **Step 2: Executar exatamente uma rodada das cinco perguntas.** A única rodada efetiva de Q1–Q5 terminou com saída 1: Q1/Q3/Q4 `REVIEW`, Q2 `FAIL`, Q5 `PASS`; um pacote privado novo foi criado. A tentativa anterior parou antes de qualquer caso/modelo e não gerou pacote. Nenhuma repetição para selecionar resultado melhor.
+- [x] **Step 3: Verificar o pacote e construir matriz privada.** JSON válido, cinco casos tentados/concluídos, commit limpo igual, hash do banco igual e nenhum problema de integridade. A matriz separada vincula nome/SHA do pacote, registra quatro respostas tecnicamente conferidas e Q2 incorreta, sem copiar SQL/resposta literal. **Validação humana do candidato continua pendente**; esta matriz é conferência assistida, não sua assinatura.
+- [ ] **Step 4: Corrigir o defeito novo e decidir reavaliação.** A Q2 trocou o ano civil explícito por janela móvel; fazer correção genérica no prompt e regressões offline sem embutir SQL/resposta do case. Uma nova rodada paga, se autorizada, deve ser **somente da Q2**, registrada como amostra nova. A correção de prompt não reclassifica a rodada reprovada nem prova estabilidade por si só.
 
 ### Task 4: Fechamento público e gates de entrega
 

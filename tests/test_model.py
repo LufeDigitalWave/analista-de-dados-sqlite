@@ -68,6 +68,14 @@ def test_prompt_guides_boolean_truth_and_final_result_shape():
     assert "métrica e as dimensões pedidas" in instructions
 
 
+def test_prompt_gives_named_calendar_year_priority_over_relative_periods():
+    instructions = OpenAIModel(FakeClient(model_response(function_call()))).instructions
+
+    assert "ano civil nomeado" in instructions
+    assert "prevalece sobre" in instructions
+    assert "janela móvel" in instructions
+
+
 def test_sql_arguments_are_decoded_without_mutating_input_history():
     history = [{"role": "user", "content": "Conte eventos"}]
     item = function_call(

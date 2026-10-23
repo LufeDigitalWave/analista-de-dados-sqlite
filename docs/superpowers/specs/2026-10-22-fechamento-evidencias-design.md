@@ -55,6 +55,12 @@ Adicionar teste sintético RED para a frase com datas completas na Q2 antes de a
 4. `pytest`, Ruff, `pip check`, verificação do diff e scan local de segredos passam na árvore final. Como é um projeto web, o smoke reproduzível de Playwright é repetido antes de afirmar que o aplicativo continua utilizável; nenhuma mudança de UI é planejada.
 5. O [README](../../../README.md) e o [checkpoint público](../../STATUS-ENTREGA.md) refletem o estado verdadeiro. Só código, testes e documentação publicável entram no Git/ZIP; conferir `git ls-files` e o manifesto do ZIP, além de `git check-ignore` no fallback, para impedir inclusão forçada de `work/`. O pacote privado fica fora. O usuário, não esta tarefa, decide o envio do link à Franq.
 
+## Evidência surgida na execução desta spec
+
+A primeira rodada real no commit `6a9d0eb` concluiu Q1–Q5 com commit limpo e hash do banco estáveis. O resultado automático foi Q1/Q3/Q4 `REVIEW`, Q2 `FAIL` e Q5 `PASS`. A conferência técnica assistida reconciliou pergunta, SQL, tabela e redação de Q1, Q3, Q4 e Q5, mas **não é a validação humana do candidato**. Na Q2, o modelo substituiu o ano civil explicitamente pedido por uma janela móvel de doze meses; SQL e resposta ficaram incorretos. O pacote e a matriz permanecem privados e a amostra reprovada não será alterada ou reclassificada.
+
+O reparo estreito subsequente é explicitar no prompt, de forma genérica, a prioridade de um ano civil nomeado sobre regras de período relativo, com regressão offline. Um teste do texto do prompt prova somente o contrato escrito, não a obediência do modelo; eventual reavaliação paga dirigida da Q2 exige decisão/autorização separada e será registrada como **nova amostra**, sem substituir a primeira.
+
 ## Limites
 
 Não implementar o Desafio 2, adicionar LangChain/LangGraph, fazer deploy, enviar e-mail, publicar banco/chave/respostas brutas nem executar Strix nesta rodada. Uma avaliação individual não demonstra estabilidade estatística ou equivalência geral entre pergunta, SQL e texto. A revisão humana reduz a incerteza desta amostra; qualquer uso posterior com dados sensíveis exige controles próprios.
