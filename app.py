@@ -8,11 +8,10 @@ import os
 from pathlib import Path
 
 import streamlit as st
-from openai import OpenAI
 
+from analista_dados import providers
 from analista_dados.agent import AgentError, DataAnalyst
 from analista_dados.database import SQLiteReadOnly
-from analista_dados.model import OpenAIModel
 from analista_dados.models import Answer, TraceStep
 from analista_dados.visualization import prepare_visualization
 
@@ -28,11 +27,6 @@ def database_path() -> Path:
     if configured.is_absolute():
         return configured
     return Path(__file__).resolve().parent / configured
-
-
-def create_openai_client() -> OpenAI:
-    """Bound one provider request so a stalled network cannot freeze the UI indefinitely."""
-    return OpenAI(timeout=30.0, max_retries=1)
 
 
 def render_steps(steps: tuple[TraceStep, ...]) -> None:
@@ -128,8 +122,9 @@ def main() -> None:
     )
     path = database_path()
     has_database = path.is_file()
-    has_key = bool(os.getenv("OPENAI_API_KEY"))
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4.1")
+    has_key = providers.has_api_key()
+    key_variable = providers.api_key_variable()
+    model_name = providers.model_name()
 
     with st.sidebar:
         st.markdown("## Configuração")
@@ -146,7 +141,7 @@ def main() -> None:
     if not has_database:
         st.warning("Banco não encontrado. Configure DATABASE_PATH para o arquivo SQLite local.")
     if not has_key:
-        st.warning("Configure OPENAI_API_KEY no ambiente para fazer perguntas.")
+        st.warning(f"Configure {key_variable} no ambiente para fazer perguntas.")
 
     example_question = None
     if "answer" not in st.session_state and "error" not in st.session_state:
@@ -165,7 +160,7 @@ def main() -> None:
         with st.status("Consultando o banco…", expanded=False) as status:
             try:
                 db = SQLiteReadOnly(path)
-                model = OpenAIModel(create_openai_client(), model=model_name)
+                model = providers.create_model()
                 st.session_state.answer = DataAnalyst(db, model).ask(question)
             except (AgentError, ValueError) as exc:
                 st.session_state.error = exc

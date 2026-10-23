@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-Delegado pelo usuário ao aprovar a especificação: Python 3.12, Streamlit, SQLite, pandas e OpenAI Responses API.
+Delegado pelo usuário ao aprovar a especificação: Python 3.12, Streamlit, SQLite, pandas e Gemini (endpoint compatível com OpenAI) por padrão, com adaptador opcional para a OpenAI Responses API.
 
 ## Users
 

@@ -1,7 +1,8 @@
 """Optional live semantic gate for the five Desafio 1 questions.
 
 Run from the repository root with ``python -m evals.live_eval [1 ... 5]``.
-It requires DATABASE_PATH and OPENAI_API_KEY and makes paid model calls; the
+It requires DATABASE_PATH and the provider key (GEMINI_API_KEY by default,
+OPENAI_API_KEY with LLM_PROVIDER=openai) and makes model calls; the
 offline tests in tests/test_live_eval.py never do. Only the five independent
 aggregate queries in reference_queries.sql define expected values. The model's
 SQL is executed unchanged by production SQLiteReadOnly and retained exactly in
@@ -1206,8 +1207,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not raw_db_path or not Path(raw_db_path).is_file():
         print("SKIP: DATABASE_PATH ausente ou arquivo indisponível")
         return 3
-    if not os.getenv("OPENAI_API_KEY"):
-        print("SKIP: OPENAI_API_KEY ausente")
+    from analista_dados import providers
+
+    try:
+        key_variable = providers.api_key_variable()
+    except ValueError:
+        print("SKIP: LLM_PROVIDER inválido")
+        return 3
+    if not providers.has_api_key():
+        print(f"SKIP: {key_variable} ausente")
         return 3
     db_path = Path(raw_db_path)
     try:
@@ -1224,16 +1232,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 3
 
     # Deliberately imported only after preflight; tests never instantiate a provider.
-    from openai import OpenAI
-
-    from analista_dados.model import OpenAIModel
-
-    client = OpenAI(timeout=30.0, max_retries=1)
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4.1")
+    model_name = providers.model_name()
     return run_evaluation(
         db_path,
         references,
-        lambda _case: OpenAIModel(client, model_name),
+        lambda _case: providers.create_model(),
         selected=selected,
         private_review=args.private_review,
         model_name=model_name,

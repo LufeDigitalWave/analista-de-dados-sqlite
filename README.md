@@ -16,7 +16,7 @@ python -m venv .venv
 python -m pip install -e ".[dev]"
 
 $env:DATABASE_PATH = 'C:\caminho\para\anexo_desafio_1.db'
-$env:OPENAI_API_KEY = '<sua-chave>'
+$env:GEMINI_API_KEY = '<sua-chave>'
 python -m streamlit run app.py --server.address 127.0.0.1
 ```
 
@@ -27,26 +27,26 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 export DATABASE_PATH=/caminho/para/anexo_desafio_1.db
-export OPENAI_API_KEY='<sua-chave>'
+export GEMINI_API_KEY='<sua-chave>'
 python -m streamlit run app.py --server.address 127.0.0.1
 ```
 
 Abra a URL local indicada pelo Streamlit. O servidor fica restrito ao loopback (`127.0.0.1`); não o exponha na rede sem autenticação e revisão de segurança. O arquivo [.env.example](.env.example) lista as opções, mas não é lido automaticamente. `DATABASE_PATH` aceita um caminho absoluto ou relativo ao projeto; sem configuração, procura `data/anexo_desafio_1.db`. O banco e a chave não devem ser adicionados ao Git.
 
-O modelo padrão é `gpt-4.1`; defina `OPENAI_MODEL` se precisar usar outro modelo compatível com [Responses API e function calling](https://developers.openai.com/api/docs/guides/function-calling). A [página oficial do GPT‑4.1](https://developers.openai.com/api/docs/models/gpt-4.1) deve ser consultada para disponibilidade atual.
-Cada solicitação ao provedor tem timeout de 30 segundos e no máximo uma repetição automática; o agente limita o número de rodadas.
+O provedor padrão é o **Gemini** (`gemini-3.1-flash-lite`), acessado pelo [endpoint compatível com OpenAI](https://ai.google.dev/gemini-api/docs/openai) com function calling; defina `GEMINI_MODEL` para usar outro modelo Gemini com function calling (a lista de modelos disponíveis muda, então confira a documentação atual). Um adaptador da OpenAI Responses API continua disponível: use `LLM_PROVIDER=openai`, `OPENAI_API_KEY` e, opcionalmente, `OPENAI_MODEL` (padrão `gpt-4.1`).
+Cada solicitação ao provedor tem timeout limitado (60 s no Gemini, 30 s na OpenAI) e no máximo uma repetição automática; o agente limita o número de rodadas.
 
 ## Como funciona
 
 ```text
-Pergunta → agente (Responses API)
+Pergunta → agente (function calling)
             ├─ inspect_schema → esquema e contagens de categorias seguras
             ├─ run_sql        → executor somente leitura → resultado ou erro
             └─ finish_answer → resposta + índice da consulta de evidência
          → Streamlit: texto + tabela/gráfico + trilha de SQL
 ```
 
-Há **um agente e três ferramentas**, sem LangChain/LangGraph: para este escopo, o [function calling nativo](https://developers.openai.com/api/docs/guides/function-calling) mantém o fluxo curto e testável. O modelo não recebe o esquema fixo no prompt; deve descobri-lo em cada pergunta. O catálogo informa as grafias realmente presentes apenas em dimensões categóricas revisadas, com contagens, para evitar filtros que confundam maiúsculas ou acentos. Se uma consulta falhar, recebe o erro controlado e pode tentar corrigi-la. Pode executar consultas intermediárias antes de concluir; a consulta de apresentação precisa ser a **última consulta bem-sucedida**. Uma resposta baseada em resultado vazio ou zero exige sondagem anterior, sem filtro redutor nem `JOIN`, da dimensão usada no recorte. Sem evidência SQL, o servidor exibe apenas um pedido neutro de esclarecimento, sem repetir afirmações livres do modelo. O aplicativo não exibe pensamento privado do modelo, apenas passos operacionais.
+Há **um agente e três ferramentas**, sem LangChain/LangGraph: para este escopo, o function calling nativo do provedor mantém o fluxo curto e testável. O modelo não recebe o esquema fixo no prompt; deve descobri-lo em cada pergunta. O catálogo informa as grafias realmente presentes apenas em dimensões categóricas revisadas, com contagens, para evitar filtros que confundam maiúsculas ou acentos. Se uma consulta falhar, recebe o erro controlado e pode tentar corrigi-la. Pode executar consultas intermediárias antes de concluir; a consulta de apresentação precisa ser a **última consulta bem-sucedida**. Uma resposta baseada em resultado vazio ou zero exige sondagem anterior, sem filtro redutor nem `JOIN`, da dimensão usada no recorte. Sem evidência SQL, o servidor exibe apenas um pedido neutro de esclarecimento, sem repetir afirmações livres do modelo. O aplicativo não exibe pensamento privado do modelo, apenas passos operacionais.
 
 O executor abre o arquivo em `mode=ro`, ativa `query_only`, valida a árvore SQL antes de executar uma única instrução `SELECT`/`WITH`, usa autorizador SQLite, bloqueia acesso direto a colunas pessoais conhecidas e interrompe consultas demoradas. Por padrão: 200 linhas e 128 KiB de resultado por consulta, 3 segundos por SQL, 8 rodadas do agente, até 4 erros SQL, 4.000 caracteres por pergunta e limite SQLite de 64 KiB para valores/texto. A inspeção do esquema também tem limite de tempo/tamanho. Na execução de cada SQL, a inspeção de autorização, a validação e a leitura ocorrem na mesma conexão e transação SQLite, sem reutilizar uma aprovação de esquema em cache. As flags `resolvido` e `interagiu` só recebem aprovação se o tipo declarado e todos os valores reais no snapshot forem compatíveis com `BOOLEAN`/inteiro `0`/`1`/`NULL`; podem então ser filtradas ou agrupadas com uma métrica, mas não exibidas registro a registro. A camada de visualização valida as colunas e o eixo numérico antes de desenhar o gráfico; a adequação semântica de barras ou linha ainda depende do agente e da revisão humana. A tabela continua disponível. Se o resultado estiver truncado, a interface avisa e não o transforma em gráfico. Texto da pergunta e do modelo é exibido literalmente, sem interpretar Markdown ou carregar imagens remotas.
 

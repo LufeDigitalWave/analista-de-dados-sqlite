@@ -6,20 +6,6 @@ import app
 from analista_dados.models import Answer, ChartSpec, QueryResult, TraceStep
 
 
-def test_api_client_has_bounded_request_time_and_retries(monkeypatch):
-    observed = {}
-    client = object()
-
-    def fake_openai(**kwargs):
-        observed.update(kwargs)
-        return client
-
-    monkeypatch.setattr(app, "OpenAI", fake_openai)
-
-    assert app.create_openai_client() is client
-    assert observed == {"timeout": 30.0, "max_retries": 1}
-
-
 def test_model_supplied_text_never_uses_markdown_renderers(monkeypatch):
     payload = "![x](//example.invalid/EXAMPLE_PRIVATE)"
     fake_streamlit = MagicMock()
