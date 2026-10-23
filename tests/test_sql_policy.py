@@ -112,6 +112,19 @@ def _policy():
         pytest.fail(f"Módulo de política SQL ainda ausente: {exc}")
 
 
+def test_positional_group_by_rejection_tells_model_how_to_group() -> None:
+    policy = _policy()
+    sql = "SELECT canal, COUNT(*) AS total FROM compras GROUP BY 1"
+
+    with pytest.raises(policy.SQLPolicyError) as raised:
+        policy.validate_sql(sql, SCHEMA)
+
+    message = str(raised.value)
+    assert "posição" in message
+    assert "alias" in message
+    assert "GROUP BY 1" in message
+
+
 def test_date_literal_rejection_explains_safe_relative_window() -> None:
     policy = _policy()
     sql = "SELECT COUNT(*) FROM suporte WHERE date(data_contato) >= date('2025-07-22', '-1 year')"

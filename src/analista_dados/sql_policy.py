@@ -236,6 +236,12 @@ def _validate_select(
     group = query.args.get("group")
     if group:
         for expression in group.expressions:
+            if isinstance(expression, exp.Literal) and expression.is_int:
+                raise SQLPolicyError(
+                    "Agrupamento por posição (GROUP BY 1) não é aceito. Agrupe pelo nome da "
+                    "coluna categórica, por um alias definido na projeção ou pela expressão "
+                    "completa, por exemplo GROUP BY strftime('%Y-%m', coluna_data), canal."
+                )
             kind, key = _group_dimension(expression, scope, catalog, ctes)
             if kind not in {"category", "flag", "month"} or key is None:
                 raise SQLPolicyError("Agrupamento por identificador ou dimensão não aprovada.")
